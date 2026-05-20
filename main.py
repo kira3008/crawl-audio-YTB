@@ -3,6 +3,8 @@ import sys
 import json
 import re
 import time
+import queue
+import threading
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,19 +51,26 @@ def get_ffmpeg_dir() -> str | None:
 
 def check_dependencies():
     missing = []
-    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisper", "faster_whisper"):
+    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisperx"):
         try:
             __import__(pkg)
         except ImportError:
-            install_name = {
-                "whisper": "openai-whisper",
-                "faster_whisper": "faster-whisper",
-            }.get(pkg, pkg.replace("_", "-"))
-            missing.append(install_name)
-    if missing:
-        print(f"Đang cài dependencies: {', '.join(missing)} ...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
-        print("Xong.\n")
+            missing.append(pkg.replace("_", "-"))
+
+    if not missing:
+        return
+
+    has_whisperx = "whisperx" in missing
+    other = [p for p in missing if p != "whisperx"]
+
+    if other:
+        print(f"Đang cài dependencies: {', '.join(other)} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + other)
+
+    if has_whisperx:
+        print("Đang cài whisperx (bao gồm PyTorch ~2GB, có thể mất vài phút) ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "whisperx"])
+        print("Cài whisperx xong.\n")
 
 
 def _detect_gpu() -> bool:
@@ -78,23 +87,31 @@ def _detect_gpu() -> bool:
 
 def _load_whisper_model(model_name: str):
     """
-    Load Whisper model ưu tiên faster-whisper (GPU nếu có, fallback CPU int8).
-    Nếu faster-whisper chưa cài → dùng openai-whisper.
-    Trả về (model, backend) với backend là 'faster' hoặc 'openai'.
+    Load WhisperX (GPU nếu có, fallback CPU int8).
+    Trả về (bundle, backend, device) với:
+      bundle = {"asr": model, "align": align_model, "meta": metadata, "device": device}
+      backend = "whisperx"
     """
-    try:
-        from faster_whisper import WhisperModel
-        has_gpu = _detect_gpu()
-        if has_gpu:
-            device, compute_type = "cuda", "float16"
-        else:
-            device, compute_type = "cpu", "int8"
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        return model, "faster", device
-    except ImportError:
-        import whisper as _whisper
-        model = _whisper.load_model(model_name)
-        return model, "openai", "cpu"
+    import warnings
+    warnings.filterwarnings("ignore", message="torchcodec is not installed")
+    import whisperx
+
+    device = "cpu"
+    compute_type = "int8"
+
+    if _detect_gpu():
+        try:
+            asr_model = whisperx.load_model(model_name, device="cuda", compute_type="int8", language="vi")
+            device = "cuda"
+        except Exception:
+            asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8", language="vi")
+    else:
+        asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8", language="vi")
+
+    align_model, metadata = whisperx.load_align_model(language_code="vi", device=device)
+
+    bundle = {"asr": asr_model, "align": align_model, "meta": metadata, "device": device}
+    return bundle, "whisperx", device
 
 
 def _vi_stats(text: str) -> tuple[int, float]:
@@ -222,118 +239,97 @@ def search_until_enough(keyword: str, needed: int, status_fn=None) -> tuple[list
         fetch = min(fetch + needed, max_fetch)
 
 
-# ── script extraction ────────────────────────────────────────────────────────
-
-def _ts_to_sec(ts: str) -> float:
-    """'HH:MM:SS.mmm' or 'HH:MM:SS,mmm' → float seconds."""
-    ts = ts.replace(",", ".")
-    h, m, s = ts.split(":")
-    return int(h) * 3600 + int(m) * 60 + float(s)
-
+# ── transcription ────────────────────────────────────────────────────────────
 
 def _sec_to_hms(sec: float) -> str:
-    """float seconds → 'hh:mm:ss'."""
+    """float seconds → 'hh:mm:ss.mmm'."""
+    ms = round((sec % 1) * 1000)
     total = int(sec)
+    if ms == 1000:
+        ms = 0
+        total += 1
     h = total // 3600
     m = (total % 3600) // 60
     s = total % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def _find_vtt(output_dir: str, safe_title: str) -> Path | None:
-    """Locate the VTT subtitle file yt-dlp saved for this video."""
-    for f in Path(output_dir).iterdir():
-        if f.suffix == ".vtt":
-            # yt-dlp names subs "<title>.<lang>.vtt" → stem = "<title>.<lang>"
-            base = f.stem.rsplit(".", 1)[0] if "." in f.stem else f.stem
-            if base == safe_title:
-                return f
-    return None
 
-
-def _parse_vtt(vtt_path: Path) -> list[dict]:
-    """Parse WebVTT → [{start, end, text}], deduplicating auto-caption repeats."""
-    content = vtt_path.read_text(encoding="utf-8", errors="replace")
-
-    entries: list[dict] = []
-    # Match timestamp line + following text block
-    block_re = re.compile(
-        r"(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})[^\n]*\n"
-        r"((?:(?!\n\n|\d{2}:\d{2}:\d{2}).)+)",
-        re.DOTALL,
-    )
-    prev_text = ""
-    for m in block_re.finditer(content):
-        raw = m.group(3)
-        # strip HTML tags (e.g. <c.color>, <b>, alignment markers)
-        text = re.sub(r"<[^>]+>", "", raw)
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text or text == prev_text:
-            continue
-        entries.append({
-            "start": _sec_to_hms(_ts_to_sec(m.group(1))),
-            "end":   _sec_to_hms(_ts_to_sec(m.group(2))),
-            "text":  text,
-        })
-        prev_text = text
-
-    return entries
-
-
-def extract_script(safe_title: str, output_dir: str) -> bool:
-    """Find the downloaded VTT, convert to JSON, delete VTT. Returns True if saved."""
-    vtt = _find_vtt(output_dir, safe_title)
-    if not vtt:
-        return False
-    try:
-        entries = _parse_vtt(vtt)
-        if not entries:
-            vtt.unlink(missing_ok=True)
-            return False
-        json_path = Path(output_dir) / f"{safe_title}.json"
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(entries, f, ensure_ascii=False, indent=2)
-        vtt.unlink(missing_ok=True)
-        return True
-    except Exception:
-        return False
-
-
-def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "openai") -> bool:
-    """Dùng Whisper model (đã load) nhận diện giọng nói từ MP3 → JSON [{start, end, text}]."""
+def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "whisperx") -> bool:
+    """Dùng WhisperX + PhoWhisper nhận diện giọng nói từ MP3 → JSON [{start, end, text}].
+    Alignment bước 2 căn chỉnh timestamp chính xác theo audio thực tế.
+    """
+    import logging
     mp3_path = Path(output_dir) / f"{safe_title}.mp3"
     if not mp3_path.exists():
+        logging.warning(f"[transcribe] MP3 not found: {mp3_path}")
         return False
     try:
-        if backend == "faster":
-            segments_iter, _ = model.transcribe(str(mp3_path), language="vi")
-            entries = [
-                {
-                    "start": _sec_to_hms(seg.start),
-                    "end":   _sec_to_hms(seg.end),
-                    "text":  seg.text.strip(),
-                }
-                for seg in segments_iter
-                if seg.text.strip()
-            ]
-        else:
-            result = model.transcribe(str(mp3_path), language="vi", verbose=False)
-            entries = [
-                {
-                    "start": _sec_to_hms(seg["start"]),
-                    "end":   _sec_to_hms(seg["end"]),
-                    "text":  seg["text"].strip(),
-                }
-                for seg in result["segments"]
-                if seg["text"].strip()
-            ]
-        if not entries:
+        import whisperx
+
+        bundle = model  # {"asr", "align", "meta", "device"}
+        device = bundle["device"]
+        batch_size = 16 if device == "cuda" else 4
+
+        audio = whisperx.load_audio(str(mp3_path))
+
+        # Bước 1: nhận diện văn bản, tự giảm batch_size nếu OOM
+        result = None
+        while batch_size >= 1:
+            try:
+                import torch
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                result = bundle["asr"].transcribe(audio, batch_size=batch_size, language="vi")
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and batch_size > 1:
+                    batch_size = batch_size // 2
+                    logging.warning(f"[transcribe] OOM — giảm batch_size xuống {batch_size}")
+                else:
+                    raise
+        if result is None:
             return False
+
+        # Bước 2: căn chỉnh timestamp khớp chính xác với audio
+        aligned = whisperx.align(
+            result["segments"],
+            bundle["align"],
+            bundle["meta"],
+            audio,
+            device=device,
+            return_char_alignments=False,
+        )
+
+        entries = []
+        for seg in aligned["segments"]:
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+            # Dùng word-level boundaries để timestamp chính xác hơn segment-level ASR
+            words = [w for w in seg.get("words", []) if "start" in w and "end" in w]
+            if words:
+                start = words[0]["start"]
+                end   = words[-1]["end"]
+            else:
+                start = seg["start"]
+                end   = seg["end"]
+            entries.append({
+                "start": _sec_to_hms(start),
+                "end":   _sec_to_hms(end),
+                "text":  text,
+            })
+
+        if not entries:
+            logging.warning(f"[transcribe] No segments found in: {mp3_path}")
+            return False
+
         json_path = Path(output_dir) / f"{safe_title}.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(entries, f, ensure_ascii=False, indent=2)
         return True
-    except Exception:
+    except Exception as e:
+        logging.error(f"[transcribe] Error transcribing {mp3_path}: {e}", exc_info=True)
         return False
 
 
@@ -437,16 +433,21 @@ def get_downloaded_titles(output_dir: str) -> set[str]:
 
 # ── markdown log ─────────────────────────────────────────────────────────────
 
-def update_links_md(videos: list[dict], output_dir: str):
+def _init_links_section(output_dir: str):
+    """Ghi header section một lần khi bắt đầu batch download."""
     links_file = Path(output_dir) / "crawled_links.md"
-    header = "" if links_file.exists() else "# Danh sách video đã crawl\n\n"
+    doc_header = "" if links_file.exists() else "# Danh sách video đã crawl\n\n"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    section = f"## {timestamp}\n\n"
-    for v in videos:
-        section += f"- [{v['title']}]({v['url']}) — {v['channel']} `{format_duration(v.get('duration'))}`\n"
-    section += "\n"
     with open(links_file, "a", encoding="utf-8") as f:
-        f.write(header + section)
+        f.write(f"{doc_header}## {timestamp}\n\n")
+
+
+def _append_link(video: dict, output_dir: str):
+    """Append một dòng ngay khi video xử lý xong (thread-safe vì GIL bảo vệ file.write)."""
+    links_file = Path(output_dir) / "crawled_links.md"
+    line = f"- [{video['title']}]({video['url']}) — {video['channel']} `{format_duration(video.get('duration'))}`\n"
+    with open(links_file, "a", encoding="utf-8") as f:
+        f.write(line)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -509,14 +510,16 @@ def main():
     max_workers = int(workers_choice[0])
 
     whisper_choice = questionary.select(
-        "Whisper model (dùng khi không có caption VTT):",
+        "Whisper model — tiếng Việt (dùng khi không có caption VTT):",
         choices=[
-            "tiny   — nhanh nhất, ít chính xác (~39MB)",
-            "base   — cân bằng tốt (~74MB) [mặc định]",
-            "small  — chính xác hơn (~244MB)",
-            "medium — tốt nhất cho tiếng Việt (~769MB)",
+            "tiny        — nhanh nhất, ít chính xác (~39MB)",
+            "base        — cân bằng tốt (~74MB)",
+            "small       — chính xác hơn (~244MB)",
+            "medium      — rất tốt (~769MB) [mặc định]",
+            "large-v2    — tốt, ổn định (~1.5GB)",
+            "large-v3    — tốt nhất cho tiếng Việt (~1.5GB)",
         ],
-        default="base   — cân bằng tốt (~74MB) [mặc định]",
+        default="medium      — rất tốt (~769MB) [mặc định]",
     ).ask()
     if whisper_choice is None:
         return
@@ -611,9 +614,17 @@ def main():
         f"[cyan]{max_workers}[/cyan] luồng song song[/bold]\n"
     )
 
-    # ── parallel download ─────────────────────────────────────────────────────
+    # ── load model trước download để pipeline kịp thời ───────────────────────
+    console.print(f"\n[bold]🎙 Load Whisper model [cyan]{whisper_model}[/cyan]…[/bold]")
+    wmodel, backend, device = _load_whisper_model(whisper_model)
+    console.print(f"[dim]Backend: WhisperX [{device.upper()}] + alignment vi[/dim]\n")
+
+    # ── parallel download + pipeline transcription ────────────────────────────
     ffmpeg_dir = get_ffmpeg_dir()
     success, failed = [], []
+
+    _init_links_section(output_dir)
+    transcribe_q: queue.Queue = queue.Queue()
 
     with Progress(
         TextColumn("[bold white]{task.fields[title]}", table_column=Column(min_width=36, max_width=36, no_wrap=True)),
@@ -626,7 +637,6 @@ def main():
         expand=False,
     ) as progress:
 
-        # register one task per video up-front so all rows appear immediately
         task_map: dict[str, int] = {}
         for v in to_download:
             short = v["title"][:34] + ("…" if len(v["title"]) > 34 else "")
@@ -634,6 +644,23 @@ def main():
                 "", total=None, title=short, status="[dim]Chờ…[/dim]",
             )
             task_map[v["id"]] = tid
+
+        def _transcribe_worker():
+            while True:
+                item = transcribe_q.get()
+                if item is None:
+                    break
+                vid, tid = item
+                safe = sanitize_filename(vid["title"])
+                progress.update(tid, status="[blue]🎙 Transcribing…[/blue]")
+                has_script = transcribe_audio(safe, output_dir, wmodel, backend)
+                _append_link(vid, output_dir)
+                label = "[green]✓ +script[/green]" if has_script else "[green]✓ Xong[/green]"
+                progress.update(tid, status=label)
+                transcribe_q.task_done()
+
+        t_worker = threading.Thread(target=_transcribe_worker, daemon=True)
+        t_worker.start()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
@@ -654,39 +681,14 @@ def main():
 
                 if ok:
                     success.append(video)
+                    transcribe_q.put((video, tid))
                 else:
                     progress.update(tid, status="[red]✗ Lỗi[/red]")
                     failed.append(video)
 
-    # ── whisper transcription (sequential, single model load) ────────────────
-    if success:
-        from rich.progress import SpinnerColumn
-
-        console.print(f"\n[bold]🎙 Load Whisper model [cyan]{whisper_model}[/cyan]…[/bold]")
-        wmodel, backend, device = _load_whisper_model(whisper_model)
-        backend_label = f"faster-whisper [{device.upper()}]" if backend == "faster" else "openai-whisper [CPU]"
-        console.print(f"[dim]Backend: {backend_label}[/dim]\n")
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold white]{task.fields[title]}", table_column=Column(min_width=36, max_width=36, no_wrap=True)),
-            TextColumn("{task.fields[status]}"),
-            console=console,
-        ) as wprogress:
-            for video in success:
-                safe_title = sanitize_filename(video["title"])
-                short = video["title"][:34] + ("…" if len(video["title"]) > 34 else "")
-                wtid = wprogress.add_task("", title=short, status="[blue]🎙 Transcribing…[/blue]")
-                has_script = transcribe_audio(safe_title, output_dir, wmodel, backend)
-                wprogress.update(
-                    wtid,
-                    status="[green]✓ +script[/green]" if has_script else "[dim]không có audio[/dim]",
-                    completed=1, total=1,
-                )
-
-    # ── markdown log ─────────────────────────────────────────────────────────
-    if success:
-        update_links_md(success, output_dir)
+        # Chờ transcription worker xử lý hết queue trước khi đóng progress
+        transcribe_q.put(None)
+        t_worker.join()
 
     # count JSON script files actually saved
     out = Path(output_dir)
@@ -698,7 +700,7 @@ def main():
     # ── summary panel ─────────────────────────────────────────────────────────
     lines = [f"[green]✓ {len(success)} file MP3 đã tải[/green]"]
     if script_count:
-        lines.append(f"[green]📝 {script_count} script JSON (có captions)[/green]")
+        lines.append(f"[green]📝 {script_count} script JSON (WhisperX)[/green]")
     no_script = len(success) - script_count
     if no_script:
         lines.append(f"[dim]   {no_script} video không có captions tiếng Việt[/dim]")

@@ -1,15 +1,15 @@
 """
-Core logic for splitting audio files
+Core logic for splitting audio files based on WhisperX JSON timestamps.
 """
 import json
 import subprocess
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional
 
 from splitter_utils import (
-    sanitize_filename,
     find_media_file,
     get_ffmpeg_path,
+    sanitize_filename,
     format_time,
     print_success,
     print_error,
@@ -18,216 +18,186 @@ from splitter_utils import (
 )
 
 
+def _hms_to_sec(ts) -> float:
+    """'HH:MM:SS.mmm' string hoặc số float → float seconds."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    h, m, s = str(ts).split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
 class AudioSplitter:
-    """Main audio splitting class"""
-    
-    def __init__(self, json_file: str, output_dir: Optional[str] = None):
-        """
-        Initialize AudioSplitter
-        
-        Args:
-            json_file: Path to JSON file with timestamps
-            output_dir: Output directory (default: json_dir/segments/{json_stem})
-        """
-        self.json_path = Path(json_file).resolve()
-        self.entries: List[Dict] = []
+    def __init__(
+        self,
+        json_file: str,
+        output_dir: Optional[str] = None,
+        min_dur: float = 1.0,       # giây — bỏ qua segment ngắn hơn
+        max_dur: float = 30.0,      # giây — bỏ qua segment dài hơn
+        padding_ms: int = 100,      # ms thêm vào mỗi đầu/cuối khi cắt
+    ):
+        self.json_path   = Path(json_file).resolve()
+        self.min_dur     = min_dur
+        self.max_dur     = max_dur
+        self.padding_sec = padding_ms / 1000.0
+        self.entries: list[dict] = []
         self.media_file: Optional[Path] = None
-        self.ffmpeg_cmd: str = get_ffmpeg_path()
-        
-        # Set output directory
+        self.ffmpeg_cmd  = get_ffmpeg_path()
+
         if output_dir is None:
             self.output_dir = self.json_path.parent / "segments" / self.json_path.stem
         else:
             self.output_dir = Path(output_dir)
-        
-        self.stats = {
-            "total": 0,
-            "success": 0,
-            "failed": 0,
-            "skipped": 0,
-        }
-        self.failed_entries: List[Tuple[int, str, str]] = []
-    
+
+        self.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0}
+        self.manifest: list[dict] = []
+
+    # ── setup ─────────────────────────────────────────────────────────────────
+
     def load_json(self) -> bool:
-        """Load and validate JSON file"""
         if not self.json_path.exists():
             print_error(f"File không tồn tại: {self.json_path}")
             return False
-        
-        # Check file extension
-        if self.json_path.suffix.lower() != '.json':
-            print_error(f"File phải có extension .json, nhưng bạn cung cấp: {self.json_path.suffix}")
-            print_info(f"Hãy chạy với: python run_splitter.py \"{self.json_path.with_suffix('.json')}\"")
+        if self.json_path.suffix.lower() != ".json":
+            print_error(f"Cần file .json, nhận được: {self.json_path.suffix}")
             return False
-        
         try:
-            with open(self.json_path, 'r', encoding='utf-8') as f:
+            with open(self.json_path, encoding="utf-8") as f:
                 data = json.load(f)
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             print_error(f"Lỗi đọc JSON: {e}")
             return False
-        except UnicodeDecodeError as e:
-            print_error(f"Lỗi encoding file JSON: {e}")
-            print_info("File JSON có thể bị hỏng. Hãy kiểm tra lại.")
-            return False
-        
         if not isinstance(data, list):
             print_error("JSON phải là một mảng các entries")
             return False
-        
         self.entries = data
         self.stats["total"] = len(data)
         return True
-    
+
     def validate_setup(self) -> bool:
-        """Validate all required files exist"""
         if not self.entries:
-            print_error("Không có entries trong JSON")
+            print_error("JSON không có entries")
             return False
-        
-        # Find media file
         self.media_file = find_media_file(self.json_path)
         if not self.media_file:
-            print_error(f"Không tìm thấy file media: {self.json_path.name}")
+            print_error(f"Không tìm thấy file MP3 tương ứng: {self.json_path.stem}.mp3")
             return False
-        
-        # Check FFmpeg
         try:
             subprocess.run(
                 [self.ffmpeg_cmd, "-version"],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=5
+                capture_output=True, timeout=5,
             )
         except Exception as e:
             print_error(f"FFmpeg không khả dụng: {e}")
             return False
-        
         return True
-    
+
     def prepare_output_dir(self):
-        """Create output directory"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
-    
-    def split_segment(self, idx: int, entry: Dict) -> bool:
-        """
-        Extract a single audio segment
-        
-        Args:
-            idx: Entry index (1-based)
-            entry: Entry dict with start, end, text
-        
-        Returns:
-            True if successful, False otherwise
-        """
+
+    # ── split ─────────────────────────────────────────────────────────────────
+
+    def split_segment(self, idx: int, entry: dict) -> bool:
+        raw_start = entry.get("start")
+        raw_end   = entry.get("end")
+        text      = entry.get("text", "").strip()
+
+        if raw_start is None or raw_end is None:
+            print_warning(f"[{idx}] Thiếu start/end — bỏ qua")
+            self.stats["skipped"] += 1
+            return False
+
+        start_sec = _hms_to_sec(raw_start)
+        end_sec   = _hms_to_sec(raw_end)
+        duration  = end_sec - start_sec
+
+        if duration < self.min_dur:
+            self.stats["skipped"] += 1
+            return False
+        if duration > self.max_dur:
+            self.stats["skipped"] += 1
+            return False
+
+        # Áp dụng padding — không vượt qua 0 ở đầu
+        cut_start = max(0.0, start_sec - self.padding_sec)
+        cut_dur   = (end_sec + self.padding_sec) - cut_start
+
+        safe_text = sanitize_filename(text)[:80] if text else "segment"
+        filename  = f"{idx:04d}_{safe_text}.mp3"
+        out_path  = self.output_dir / filename
+
+        # Re-encode (libmp3lame) để cắt chính xác theo ms.
+        # -c copy với MP3 snap về frame boundary (~26ms error).
+        cmd = [
+            self.ffmpeg_cmd, "-y",
+            "-i",      str(self.media_file),
+            "-ss",     f"{cut_start:.3f}",
+            "-t",      f"{cut_dur:.3f}",
+            "-acodec", "libmp3lame",
+            "-q:a",    "2",
+            str(out_path),
+        ]
+
         try:
-            start_time = entry.get('start')
-            end_time = entry.get('end')
-            text = entry.get('text', '').strip()
-            
-            # Validate timestamps
-            if start_time is None or end_time is None:
-                print_warning(f"[{idx}] Thiếu start/end time")
-                self.stats["skipped"] += 1
-                return False
-            
-            duration = end_time - start_time
-            
-            # Skip segments that are too short (< 0.1 seconds)
-            min_duration = 0.1
-            if duration < min_duration:
-                print_warning(f"[{idx}] Segment quá ngắn ({duration:.3f}s < {min_duration}s) → Bỏ qua")
-                self.stats["skipped"] += 1
-                return False
-            
-            # Create filename
-            if text:
-                safe_text = sanitize_filename(text)
-                filename = f"{idx:04d}_{safe_text}.mp3"
-            else:
-                filename = f"{idx:04d}_segment.mp3"
-            
-            output_file = self.output_dir / filename
-            
-            # Run FFmpeg
-            cmd = [
-                self.ffmpeg_cmd,
-                "-i", str(self.media_file),
-                "-ss", str(start_time),
-                "-t", str(duration),
-                "-c", "copy",
-                "-y",
-                str(output_file)
-            ]
-            
             result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=300
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120,
             )
-            
-            if result.returncode == 0:
-                self.stats["success"] += 1
-                return True
-            else:
-                self.failed_entries.append((idx, filename, result.stderr[:100]))
-                self.stats["failed"] += 1
-                return False
-        
         except subprocess.TimeoutExpired:
-            self.failed_entries.append((idx, filename, "Timeout"))
+            print_error(f"[{idx}] Timeout")
             self.stats["failed"] += 1
             return False
         except Exception as e:
-            self.failed_entries.append((idx, filename, str(e)[:100]))
+            print_error(f"[{idx}] {e}")
             self.stats["failed"] += 1
             return False
-    
+
+        if result.returncode != 0:
+            print_error(f"[{idx}] ffmpeg lỗi: {result.stderr[-200:]}")
+            self.stats["failed"] += 1
+            return False
+
+        self.stats["success"] += 1
+        self.manifest.append({
+            "file":     filename,
+            "start":    raw_start,
+            "end":      raw_end,
+            "duration": round(duration, 3),
+            "text":     text,
+        })
+        return True
+
+    # ── process ───────────────────────────────────────────────────────────────
+
     def process(self) -> bool:
-        """Process all entries"""
-        print_info(f"File media: {self.media_file.name}")
-        print_info(f"Total entries: {len(self.entries)}")
-        print_info(f"Min duration to extract: 0.1s (bỏ qua nếu < 0.1s)")
-        print_info(f"Output directory: {self.output_dir}\n")
-        
+        print_info(f"Media : {self.media_file.name}")
+        print_info(f"Entries: {len(self.entries)}")
+        print_info(f"Filter : {self.min_dur}s – {self.max_dur}s · padding {int(self.padding_sec*1000)}ms")
+        print_info(f"Output : {self.output_dir}\n")
+
         for idx, entry in enumerate(self.entries, 1):
-            text = entry.get('text', '')[:50]
-            start = entry.get('start', 0)
-            end = entry.get('end', 0)
-            duration = end - start
-            
-            success = self.split_segment(idx, entry)
-            
-            # Only print successful and failed - skip short segments from output
-            if duration >= 0.1:
-                status = "✅" if success else "❌"
-                print(f"{status} [{idx}/{len(self.entries)}] {format_time(start)} → {format_time(end)} ({duration:.3f}s)")
-                print(f"   └─ {text}...\n")
-        
+            start_sec = _hms_to_sec(entry.get("start", 0))
+            end_sec   = _hms_to_sec(entry.get("end",   0))
+            duration  = end_sec - start_sec
+            text      = entry.get("text", "")[:60]
+
+            ok = self.split_segment(idx, entry)
+
+            if ok:
+                print(f"✅ [{idx:04d}] {format_time(start_sec)} → {format_time(end_sec)} ({duration:.2f}s)")
+                print(f"        {text}\n")
+
+        # Lưu manifest chứa toàn bộ metadata của các segment đã tạo
+        manifest_path = self.output_dir / "manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(self.manifest, f, ensure_ascii=False, indent=2)
+
         return self.stats["failed"] == 0
-    
+
     def print_summary(self):
-        """Print processing summary"""
-        print("\n" + "="*70)
-        print(f"✅ Thành công: {self.stats['success']}/{self.stats['total']}")
-        
-        if self.stats["failed"] > 0:
-            print(f"❌ Thất bại: {self.stats['failed']}")
-        
-        if self.stats["skipped"] > 0:
-            print(f"⏭️  Bỏ qua (quá ngắn): {self.stats['skipped']}")
-        
-        if self.failed_entries:
-            print("\n📋 Failed entries:")
-            for idx, filename, error in self.failed_entries[:10]:  # Show first 10
-                print(f"  [{idx}] {filename}: {error}")
-            
-            if len(self.failed_entries) > 10:
-                print(f"  ... và {len(self.failed_entries) - 10} entries khác")
-        
-        print("="*70 + "\n")
+        print("\n" + "=" * 60)
+        print(f"✅ Thành công : {self.stats['success']}")
+        print(f"⏭  Bỏ qua    : {self.stats['skipped']}  (ngoài {self.min_dur}s–{self.max_dur}s)")
+        if self.stats["failed"]:
+            print(f"❌ Thất bại  : {self.stats['failed']}")
+        print(f"📄 Manifest  : {self.output_dir / 'manifest.json'}")
+        print("=" * 60 + "\n")
