@@ -10,12 +10,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]
 STALL_SECONDS = 60  # seconds without byte progress → show stall warning
 
-VIETNAMESE_CHARS = set(
+_vi_base = (
     "àáâãèéêìíòóôõùúýăđơư"
     "ạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹỵ"
-    "ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯ"
-    "ẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỶỸỴ"
 )
+# Include uppercase variants automatically — avoids hand-coding Ạ, Ệ, etc.
+VIETNAMESE_CHARS = set(_vi_base + _vi_base.upper())
+
+# Minimum thresholds for the ratio-based filter
+_MIN_VI_COUNT = 2    # số ký tự tiếng Việt tối thiểu trong văn bản
+_MIN_VI_RATIO = 0.15 # tỉ lệ ký tự tiếng Việt / tổng chữ cái tối thiểu
+
+# Từ vựng tiếng Việt đặc trưng — không tồn tại trong ngôn ngữ khác
+# Dùng như tầng lọc thứ hai khi ratio thấp (title có nhiều từ tiếng Anh xen lẫn)
+_VI_KEYWORDS = frozenset({
+    "nhạc", "bài", "hát", "việt", "tiếng", "trẻ", "hay", "nhất",
+    "tình", "yêu", "buồn", "vui", "đẹp", "mới", "lời", "triệu",
+    "nghe", "nhiều", "không", "được", "người", "liên", "khúc",
+    "remix", "cover", "phim", "kênh", "mùa", "thôi", "rồi",
+    "chia", "sẻ", "quảng", "cáo", "gây", "nghiện", "tâm", "trạng",
+})
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -46,8 +60,56 @@ def check_dependencies():
         print("Xong.\n")
 
 
-def is_vietnamese(text: str) -> bool:
-    return any(c in VIETNAMESE_CHARS for c in (text or ""))
+def _vi_stats(text: str) -> tuple[int, float]:
+    """Returns (vi_char_count, ratio_to_alpha) for the given text."""
+    if not text:
+        return 0, 0.0
+    vi    = sum(1 for c in text if c in VIETNAMESE_CHARS)
+    alpha = sum(1 for c in text if c.isalpha())
+    return vi, (vi / alpha if alpha else 0.0)
+
+
+def _is_vi_text(text: str) -> bool:
+    """True when text itself is predominantly Vietnamese."""
+    count, ratio = _vi_stats(text)
+    return count >= _MIN_VI_COUNT and ratio >= _MIN_VI_RATIO
+
+
+def _has_vi_keyword(text: str) -> bool:
+    lower = text.lower()
+    return any(kw in lower for kw in _VI_KEYWORDS)
+
+
+def is_vietnamese_video(info: dict) -> bool:
+    """
+    Multi-signal filter — returns True only when confident the video is Vietnamese.
+
+    Pass criteria (checked in order):
+      1. YouTube metadata explicitly marks language = "vi"
+      2. Title ratio: ≥2 vi-chars AND ≥15% of alpha chars are Vietnamese
+      3. Title has ≥1 vi-char AND contains a Vietnamese keyword
+         (catches mixed titles like "TOP 30 NHẠC REMIX TIKTOK TRIỆU VIEW 2024")
+      4. Title has ≥1 vi-char with small ratio + channel name is predominantly Vietnamese
+         (catches Vietnamese channels uploading with partly-English titles)
+    """
+    if (info.get("language") or "").lower() == "vi":
+        return True
+
+    title   = info.get("title")   or ""
+    channel = info.get("uploader") or info.get("channel") or ""
+
+    if _is_vi_text(title):
+        return True
+
+    t_count, t_ratio = _vi_stats(title)
+
+    if t_count >= 1 and _has_vi_keyword(title):
+        return True
+
+    if t_count >= 1 and t_ratio >= 0.05 and _is_vi_text(channel):
+        return True
+
+    return False
 
 
 def sanitize_filename(title: str) -> str:
@@ -68,6 +130,8 @@ def format_duration(seconds) -> str:
 def search_videos(keyword: str, max_results: int) -> list[dict]:
     cmd = YTDLP_CMD + [
         "--dump-json", "--no-download", "--no-playlist", "--flat-playlist",
+        # tell YouTube's API to prefer Vietnamese-region results
+        "--extractor-args", "youtube:lang=vi",
         f"ytsearch{max_results}:{keyword}",
     ]
     result = subprocess.run(
@@ -83,15 +147,13 @@ def search_videos(keyword: str, max_results: int) -> list[dict]:
             if not vid_id:
                 continue
             url = vid_id if vid_id.startswith("http") else f"https://www.youtube.com/watch?v={vid_id}"
-            title = info.get("title") or ""
-            lang  = info.get("language") or ""
             videos.append({
                 "id":       vid_id,
-                "title":    title,
+                "title":    info.get("title")   or "",
                 "url":      url,
                 "channel":  info.get("uploader") or info.get("channel") or "N/A",
                 "duration": info.get("duration"),
-                "is_vi":    lang == "vi" or is_vietnamese(title),
+                "is_vi":    is_vietnamese_video(info),
             })
         except json.JSONDecodeError:
             continue
@@ -262,9 +324,11 @@ def main():
         ))
         return
 
+    filtered_out = len(all_videos) - len(vi_videos)
     console.print(
         f"[green]Tìm thấy[/green] [bold]{len(vi_videos)}[/bold] video tiếng Việt "
-        f"[dim](từ {len(all_videos)} kết quả)[/dim]\n"
+        f"[dim](lọc ra {filtered_out} video không phải tiếng Việt "
+        f"từ {len(all_videos)} kết quả)[/dim]\n"
     )
 
     # ── results table ─────────────────────────────────────────────────────────
