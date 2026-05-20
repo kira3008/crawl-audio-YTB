@@ -185,10 +185,15 @@ class AudioSplitter:
         print_info(f"Workers : {self.max_workers} luồng song song")
         print_info(f"Output  : {self.output_dir}\n")
 
+        # Chỉ đường ffmpeg cho pydub (dùng path đã resolve từ imageio_ffmpeg / local)
+        AudioSegment.converter = self.ffmpeg_cmd
+        AudioSegment.ffprobe   = self.ffmpeg_cmd  # fallback khi không có ffprobe riêng
+
         # Decode một lần → PCM trong RAM (chính xác tới sample)
+        # format="mp3" để bỏ qua bước ffprobe detect format
         print("  📂 Đang decode audio vào bộ nhớ...", flush=True)
         try:
-            audio = AudioSegment.from_file(str(self.media_file))
+            audio = AudioSegment.from_file(str(self.media_file), format="mp3")
         except Exception as e:
             print_error(f"Không load được audio: {e}")
             return False
