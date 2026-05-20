@@ -41,7 +41,7 @@ class AudioSplitter:
         self,
         json_file: str,
         output_dir: Optional[str] = None,
-        min_dur: float = 1.0,
+        min_dur: float = 0.3,
         max_dur: float = 30.0,
         padding_ms: int = 50,          # padding nhỏ — smart-capped bởi gap thực tế
         max_workers: Optional[int] = None,
