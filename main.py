@@ -49,11 +49,12 @@ def get_ffmpeg_dir() -> str | None:
 
 def check_dependencies():
     missing = []
-    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg"):
+    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisper"):
         try:
             __import__(pkg)
         except ImportError:
-            missing.append(pkg.replace("_", "-"))
+            install_name = "openai-whisper" if pkg == "whisper" else pkg.replace("_", "-")
+            missing.append(install_name)
     if missing:
         print(f"Đang cài dependencies: {', '.join(missing)} ...")
         subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
@@ -194,6 +195,15 @@ def _ts_to_sec(ts: str) -> float:
     return int(h) * 3600 + int(m) * 60 + float(s)
 
 
+def _sec_to_hms(sec: float) -> str:
+    """float seconds → 'hh:mm:ss'."""
+    total = int(sec)
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def _find_vtt(output_dir: str, safe_title: str) -> Path | None:
     """Locate the VTT subtitle file yt-dlp saved for this video."""
     for f in Path(output_dir).iterdir():
@@ -225,8 +235,8 @@ def _parse_vtt(vtt_path: Path) -> list[dict]:
         if not text or text == prev_text:
             continue
         entries.append({
-            "start": _ts_to_sec(m.group(1)),
-            "end":   _ts_to_sec(m.group(2)),
+            "start": _sec_to_hms(_ts_to_sec(m.group(1))),
+            "end":   _sec_to_hms(_ts_to_sec(m.group(2))),
             "text":  text,
         })
         prev_text = text
@@ -253,6 +263,34 @@ def extract_script(safe_title: str, output_dir: str) -> bool:
         return False
 
 
+def transcribe_audio(safe_title: str, output_dir: str, whisper_model: str) -> bool:
+    """Dùng Whisper nhận diện giọng nói từ MP3 → JSON [{start, end, text}]."""
+    mp3_path = Path(output_dir) / f"{safe_title}.mp3"
+    if not mp3_path.exists():
+        return False
+    try:
+        import whisper
+        model = whisper.load_model(whisper_model)
+        result = model.transcribe(str(mp3_path), language="vi", verbose=False)
+        entries = [
+            {
+                "start": _sec_to_hms(seg["start"]),
+                "end":   _sec_to_hms(seg["end"]),
+                "text":  seg["text"].strip(),
+            }
+            for seg in result["segments"]
+            if seg["text"].strip()
+        ]
+        if not entries:
+            return False
+        json_path = Path(output_dir) / f"{safe_title}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
 # ── download (single video) ───────────────────────────────────────────────────
 
 def download_one(
@@ -261,6 +299,7 @@ def download_one(
     ffmpeg_dir: str | None,
     progress,        # rich.progress.Progress (shared, thread-safe)
     task_id: int,
+    whisper_model: str = "base",
 ) -> bool:
     import yt_dlp
 
@@ -308,15 +347,15 @@ def download_one(
         "outtmpl":                        output_template,
         "progress_hooks":                 [hook],
         "concurrent_fragment_downloads":  fragments,
-        # subtitle / caption options
-        "writesubtitles":    True,   # manual subtitles
-        "writeautomaticsub": True,   # auto-generated captions (fallback)
-        "subtitleslangs":    ["vi", "vi-VN"],
-        "subtitlesformat":   "vtt",
         "quiet":       True,
         "no_warnings": True,
         "noprogress":  True,
-        "retries":     3,
+        "retries":          5,
+        "fragment_retries": 5,
+        # tránh 429: chờ 2-5s giữa các request
+        "sleep_interval":         2,
+        "max_sleep_interval":     5,
+        "sleep_interval_requests": 1,
     }
     if ffmpeg_dir:
         ydl_opts["ffmpeg_location"] = ffmpeg_dir
@@ -325,9 +364,8 @@ def download_one(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video["url"]])
 
-        # convert downloaded VTT → JSON script
-        progress.update(task_id, status="[blue]📝 Script…[/blue]")
-        has_script = extract_script(safe_title, output_dir)
+        progress.update(task_id, status="[blue]🎙 Whisper…[/blue]")
+        has_script = transcribe_audio(safe_title, output_dir, whisper_model)
         status_final = "[green]✓ +script[/green]" if has_script else "[green]✓[/green]"
         progress.update(task_id, status=status_final)
         return True
@@ -376,7 +414,7 @@ def main():
 
     from rich.console import Console
     from rich.panel import Panel
-    from rich.table import Table
+    from rich.table import Table, Column
     from rich.progress import (
         Progress, TextColumn, BarColumn,
         DownloadColumn, TransferSpeedColumn, TimeRemainingColumn,
@@ -421,12 +459,26 @@ def main():
 
     workers_choice = questionary.select(
         "Số luồng tải song song:",
-        choices=["2 luồng", "3 luồng (mặc định)", "4 luồng", "5 luồng"],
-        default="3 luồng (mặc định)",
+        choices=["1 luồng", "2 luồng (mặc định)", "3 luồng", "4 luồng"],
+        default="2 luồng (mặc định)",
     ).ask()
     if workers_choice is None:
         return
     max_workers = int(workers_choice[0])
+
+    whisper_choice = questionary.select(
+        "Whisper model (dùng khi không có caption VTT):",
+        choices=[
+            "tiny   — nhanh nhất, ít chính xác (~39MB)",
+            "base   — cân bằng tốt (~74MB) [mặc định]",
+            "small  — chính xác hơn (~244MB)",
+            "medium — tốt nhất cho tiếng Việt (~769MB)",
+        ],
+        default="base   — cân bằng tốt (~74MB) [mặc định]",
+    ).ask()
+    if whisper_choice is None:
+        return
+    whisper_model = whisper_choice.split()[0]
 
     output_dir = questionary.text("Thư mục lưu file:", default="downloads").ask()
     if output_dir is None:
@@ -522,7 +574,7 @@ def main():
     success, failed = [], []
 
     with Progress(
-        TextColumn("[bold white]{task.fields[title]}", no_wrap=True, min_width=36, max_width=36),
+        TextColumn("[bold white]{task.fields[title]}", table_column=Column(min_width=36, max_width=36, no_wrap=True)),
         BarColumn(bar_width=20),
         DownloadColumn(),
         TransferSpeedColumn(),
@@ -545,7 +597,7 @@ def main():
             future_map = {
                 executor.submit(
                     download_one, v, output_dir, ffmpeg_dir,
-                    progress, task_map[v["id"]],
+                    progress, task_map[v["id"]], whisper_model,
                 ): v
                 for v in to_download
             }
