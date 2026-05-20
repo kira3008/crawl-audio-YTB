@@ -49,11 +49,12 @@ def get_ffmpeg_dir() -> str | None:
 
 def check_dependencies():
     missing = []
-    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg"):
+    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisper"):
         try:
             __import__(pkg)
         except ImportError:
-            missing.append(pkg.replace("_", "-"))
+            install_name = "openai-whisper" if pkg == "whisper" else pkg.replace("_", "-")
+            missing.append(install_name)
     if missing:
         print(f"Đang cài dependencies: {', '.join(missing)} ...")
         subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
@@ -127,12 +128,12 @@ def format_duration(seconds) -> str:
 
 # ── search ────────────────────────────────────────────────────────────────────
 
-def search_videos(keyword: str, max_results: int) -> list[dict]:
+def search_videos(keyword: str, fetch_count: int) -> list[dict]:
+    """Fetch up to fetch_count results from YouTube search."""
     cmd = YTDLP_CMD + [
         "--dump-json", "--no-download", "--no-playlist", "--flat-playlist",
-        # tell YouTube's API to prefer Vietnamese-region results
         "--extractor-args", "youtube:lang=vi",
-        f"ytsearch{max_results}:{keyword}",
+        f"ytsearch{fetch_count}:{keyword}",
     ]
     result = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
@@ -160,6 +161,31 @@ def search_videos(keyword: str, max_results: int) -> list[dict]:
     return videos
 
 
+def search_until_enough(keyword: str, needed: int, status_fn=None) -> tuple[list[dict], int]:
+    """
+    Keep expanding the fetch window until we have `needed` Vietnamese videos
+    or YouTube has no more results to give.
+
+    Returns (vi_videos[:needed], total_fetched).
+    """
+    fetch = max(int(needed * 1.5), 10)  # start 1.5× to reduce loop rounds
+    max_fetch = max(needed * 5, 100) # hard ceiling to avoid infinite loops
+    prev_total = -1
+
+    while True:
+        if status_fn:
+            status_fn(fetch)
+        all_videos = search_videos(keyword, fetch)
+        vi_videos  = [v for v in all_videos if v["is_vi"]]
+
+        # enough results or YouTube is exhausted (no new results came in)
+        if len(vi_videos) >= needed or len(all_videos) == prev_total or fetch >= max_fetch:
+            return vi_videos[:needed], len(all_videos)
+
+        prev_total = len(all_videos)
+        fetch = min(fetch + needed, max_fetch)
+
+
 # ── script extraction ────────────────────────────────────────────────────────
 
 def _ts_to_sec(ts: str) -> float:
@@ -167,6 +193,15 @@ def _ts_to_sec(ts: str) -> float:
     ts = ts.replace(",", ".")
     h, m, s = ts.split(":")
     return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _sec_to_hms(sec: float) -> str:
+    """float seconds → 'hh:mm:ss'."""
+    total = int(sec)
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _find_vtt(output_dir: str, safe_title: str) -> Path | None:
@@ -200,8 +235,8 @@ def _parse_vtt(vtt_path: Path) -> list[dict]:
         if not text or text == prev_text:
             continue
         entries.append({
-            "start": _ts_to_sec(m.group(1)),
-            "end":   _ts_to_sec(m.group(2)),
+            "start": _sec_to_hms(_ts_to_sec(m.group(1))),
+            "end":   _sec_to_hms(_ts_to_sec(m.group(2))),
             "text":  text,
         })
         prev_text = text
@@ -223,6 +258,32 @@ def extract_script(safe_title: str, output_dir: str) -> bool:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(entries, f, ensure_ascii=False, indent=2)
         vtt.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def transcribe_audio(safe_title: str, output_dir: str, model) -> bool:
+    """Dùng Whisper model (đã load) nhận diện giọng nói từ MP3 → JSON [{start, end, text}]."""
+    mp3_path = Path(output_dir) / f"{safe_title}.mp3"
+    if not mp3_path.exists():
+        return False
+    try:
+        result = model.transcribe(str(mp3_path), language="vi", verbose=False)
+        entries = [
+            {
+                "start": _sec_to_hms(seg["start"]),
+                "end":   _sec_to_hms(seg["end"]),
+                "text":  seg["text"].strip(),
+            }
+            for seg in result["segments"]
+            if seg["text"].strip()
+        ]
+        if not entries:
+            return False
+        json_path = Path(output_dir) / f"{safe_title}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
         return True
     except Exception:
         return False
@@ -283,15 +344,15 @@ def download_one(
         "outtmpl":                        output_template,
         "progress_hooks":                 [hook],
         "concurrent_fragment_downloads":  fragments,
-        # subtitle / caption options
-        "writesubtitles":    True,   # manual subtitles
-        "writeautomaticsub": True,   # auto-generated captions (fallback)
-        "subtitleslangs":    ["vi", "vi-VN"],
-        "subtitlesformat":   "vtt",
         "quiet":       True,
         "no_warnings": True,
         "noprogress":  True,
-        "retries":     3,
+        "retries":          5,
+        "fragment_retries": 5,
+        # tránh 429: chờ 2-5s giữa các request
+        "sleep_interval":         2,
+        "max_sleep_interval":     5,
+        "sleep_interval_requests": 1,
     }
     if ffmpeg_dir:
         ydl_opts["ffmpeg_location"] = ffmpeg_dir
@@ -300,14 +361,30 @@ def download_one(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video["url"]])
 
-        # convert downloaded VTT → JSON script
-        progress.update(task_id, status="[blue]📝 Script…[/blue]")
-        has_script = extract_script(safe_title, output_dir)
-        status_final = "[green]✓ +script[/green]" if has_script else "[green]✓[/green]"
-        progress.update(task_id, status=status_final)
+        progress.update(task_id, status="[green]✓ Xong[/green]")
         return True
     except Exception:
         return False
+
+
+# ── duplicate check ──────────────────────────────────────────────────────────
+
+def get_downloaded_ids(output_dir: str) -> set[str]:
+    """Return a set of video IDs already recorded in crawled_links.md."""
+    links_file = Path(output_dir) / "crawled_links.md"
+    if not links_file.exists():
+        return set()
+    content = links_file.read_text(encoding="utf-8", errors="replace")
+    # Links are written as [title](https://www.youtube.com/watch?v=ID)
+    return set(re.findall(r"watch\?v=([A-Za-z0-9_-]+)", content))
+
+
+def get_downloaded_titles(output_dir: str) -> set[str]:
+    """Return sanitized base-names of MP3 files already present in output_dir."""
+    p = Path(output_dir)
+    if not p.exists():
+        return set()
+    return {f.stem for f in p.glob("*.mp3")}
 
 
 # ── markdown log ─────────────────────────────────────────────────────────────
@@ -331,7 +408,7 @@ def main():
 
     from rich.console import Console
     from rich.panel import Panel
-    from rich.table import Table
+    from rich.table import Table, Column
     from rich.progress import (
         Progress, TextColumn, BarColumn,
         DownloadColumn, TransferSpeedColumn, TimeRemainingColumn,
@@ -376,12 +453,26 @@ def main():
 
     workers_choice = questionary.select(
         "Số luồng tải song song:",
-        choices=["2 luồng", "3 luồng (mặc định)", "4 luồng", "5 luồng"],
-        default="3 luồng (mặc định)",
+        choices=["1 luồng", "2 luồng (mặc định)", "3 luồng", "4 luồng"],
+        default="2 luồng (mặc định)",
     ).ask()
     if workers_choice is None:
         return
     max_workers = int(workers_choice[0])
+
+    whisper_choice = questionary.select(
+        "Whisper model (dùng khi không có caption VTT):",
+        choices=[
+            "tiny   — nhanh nhất, ít chính xác (~39MB)",
+            "base   — cân bằng tốt (~74MB) [mặc định]",
+            "small  — chính xác hơn (~244MB)",
+            "medium — tốt nhất cho tiếng Việt (~769MB)",
+        ],
+        default="base   — cân bằng tốt (~74MB) [mặc định]",
+    ).ask()
+    if whisper_choice is None:
+        return
+    whisper_model = whisper_choice.split()[0]
 
     output_dir = questionary.text("Thư mục lưu file:", default="downloads").ask()
     if output_dir is None:
@@ -390,10 +481,14 @@ def main():
     console.print()
 
     # ── search ────────────────────────────────────────────────────────────────
-    with console.status(f"[bold green]Đang tìm kiếm '{keyword}'…[/bold green]"):
-        all_videos = search_videos(keyword, max_results)
+    with console.status("") as live_status:
+        def status_fn(fetch_count: int):
+            live_status.update(
+                f"[bold green]Đang tìm kiếm '{keyword}'… "
+                f"[dim](thử {fetch_count} kết quả)[/dim][/bold green]"
+            )
 
-    vi_videos = [v for v in all_videos if v["is_vi"]]
+        vi_videos, total_fetched = search_until_enough(keyword, max_results, status_fn)
 
     if not vi_videos:
         console.print(Panel(
@@ -403,11 +498,9 @@ def main():
         ))
         return
 
-    filtered_out = len(all_videos) - len(vi_videos)
     console.print(
         f"[green]Tìm thấy[/green] [bold]{len(vi_videos)}[/bold] video tiếng Việt "
-        f"[dim](lọc ra {filtered_out} video không phải tiếng Việt "
-        f"từ {len(all_videos)} kết quả)[/dim]\n"
+        f"[dim](quét {total_fetched} kết quả từ YouTube)[/dim]\n"
     )
 
     # ── results table ─────────────────────────────────────────────────────────
@@ -440,19 +533,42 @@ def main():
         console.print("[yellow]Không có video nào được chọn.[/yellow]")
         return
 
+    # ── skip already-downloaded ───────────────────────────────────────────────
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    existing_ids    = get_downloaded_ids(output_dir)
+    existing_titles = get_downloaded_titles(output_dir)
+
+    to_skip = [
+        v for v in selected
+        if v["id"] in existing_ids or sanitize_filename(v["title"]) in existing_titles
+    ]
+    to_download = [v for v in selected if v not in to_skip]
+
+    if to_skip:
+        skip_names = ", ".join(f"[dim]{v['title'][:40]}[/dim]" for v in to_skip)
+        console.print(
+            f"[yellow]⏭  Bỏ qua {len(to_skip)} video đã tải:[/yellow] {skip_names}\n"
+        )
+
+    if not to_download:
+        console.print(Panel(
+            "[green]Tất cả video đã được tải trước đó. Không có gì mới để tải.[/green]",
+            border_style="green", padding=(1, 4),
+        ))
+        return
+
     console.print()
     console.print(
-        f"[bold]Tải [cyan]{len(selected)}[/cyan] video · "
+        f"[bold]Tải [cyan]{len(to_download)}[/cyan] video mới · "
         f"[cyan]{max_workers}[/cyan] luồng song song[/bold]\n"
     )
 
     # ── parallel download ─────────────────────────────────────────────────────
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
     ffmpeg_dir = get_ffmpeg_dir()
     success, failed = [], []
 
     with Progress(
-        TextColumn("[bold white]{task.fields[title]}"),
+        TextColumn("[bold white]{task.fields[title]}", table_column=Column(min_width=36, max_width=36, no_wrap=True)),
         BarColumn(bar_width=20),
         DownloadColumn(),
         TransferSpeedColumn(),
@@ -464,7 +580,7 @@ def main():
 
         # register one task per video up-front so all rows appear immediately
         task_map: dict[str, int] = {}
-        for v in selected:
+        for v in to_download:
             short = v["title"][:34] + ("…" if len(v["title"]) > 34 else "")
             tid = progress.add_task(
                 "", total=None, title=short, status="[dim]Chờ…[/dim]",
@@ -477,7 +593,7 @@ def main():
                     download_one, v, output_dir, ffmpeg_dir,
                     progress, task_map[v["id"]],
                 ): v
-                for v in selected
+                for v in to_download
             }
 
             for future in as_completed(future_map):
@@ -493,6 +609,31 @@ def main():
                 else:
                     progress.update(tid, status="[red]✗ Lỗi[/red]")
                     failed.append(video)
+
+    # ── whisper transcription (sequential, single model load) ────────────────
+    if success:
+        from rich.progress import SpinnerColumn
+        import whisper as _whisper
+
+        console.print(f"\n[bold]🎙 Load Whisper model [cyan]{whisper_model}[/cyan]…[/bold]")
+        wmodel = _whisper.load_model(whisper_model)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold white]{task.fields[title]}", table_column=Column(min_width=36, max_width=36, no_wrap=True)),
+            TextColumn("{task.fields[status]}"),
+            console=console,
+        ) as wprogress:
+            for video in success:
+                safe_title = sanitize_filename(video["title"])
+                short = video["title"][:34] + ("…" if len(video["title"]) > 34 else "")
+                wtid = wprogress.add_task("", title=short, status="[blue]🎙 Transcribing…[/blue]")
+                has_script = transcribe_audio(safe_title, output_dir, wmodel)
+                wprogress.update(
+                    wtid,
+                    status="[green]✓ +script[/green]" if has_script else "[dim]không có audio[/dim]",
+                    completed=1, total=1,
+                )
 
     # ── markdown log ─────────────────────────────────────────────────────────
     if success:
