@@ -179,27 +179,37 @@ class AudioSplitter:
             print_error("Thiếu pydub. Chạy: pip install pydub")
             return False
 
+        import io
+
+        # Lấy path ffmpeg thật từ imageio_ffmpeg (không phụ thuộc PATH hệ thống)
+        try:
+            import imageio_ffmpeg as _iio
+            _ffmpeg_exe = _iio.get_ffmpeg_exe()
+        except Exception:
+            _ffmpeg_exe = self.ffmpeg_cmd
+
+        # Set converter cho pydub export (cần cho bước ghi MP3 sau)
+        AudioSegment.converter = _ffmpeg_exe
+
         total = len(self.entries)
         print_info(f"Media   : {self.media_file.name}")
         print_info(f"Entries : {total}  →  filter {self.min_dur}s–{self.max_dur}s · pad {self.padding_ms}ms")
         print_info(f"Workers : {self.max_workers} luồng song song")
         print_info(f"Output  : {self.output_dir}\n")
 
-        # Lấy path ffmpeg thật (imageio_ffmpeg luôn có binary đi kèm)
-        try:
-            import imageio_ffmpeg as _iio
-            _ffmpeg_exe = _iio.get_ffmpeg_exe()
-        except Exception:
-            _ffmpeg_exe = self.ffmpeg_cmd  # fallback nếu imageio_ffmpeg không dùng được
-
-        AudioSegment.converter = _ffmpeg_exe
-        AudioSegment.ffprobe   = _ffmpeg_exe   # dùng ffmpeg thay ffprobe khi probe
-
-        # Decode một lần → PCM trong RAM (chính xác tới sample)
-        # format="mp3" để bỏ qua bước ffprobe detect format
+        # Decode MP3 → WAV thô trong RAM bằng ffmpeg trực tiếp.
+        # Dùng pipe thay vì pydub.from_file để tránh hoàn toàn ffprobe.
+        # pydub.from_wav đọc WAV header bằng Python wave module — không cần ffmpeg.
         print("  📂 Đang decode audio vào bộ nhớ...", flush=True)
         try:
-            audio = AudioSegment.from_file(str(self.media_file), format="mp3")
+            proc = subprocess.run(
+                [_ffmpeg_exe, "-y", "-i", str(self.media_file), "-f", "wav", "pipe:1"],
+                capture_output=True, timeout=600,
+            )
+            if proc.returncode != 0:
+                print_error(f"ffmpeg decode lỗi:\n{proc.stderr[-300:].decode(errors='replace')}")
+                return False
+            audio = AudioSegment.from_wav(io.BytesIO(proc.stdout))
         except Exception as e:
             print_error(f"Không load được audio: {e}")
             return False
