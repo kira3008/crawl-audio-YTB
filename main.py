@@ -452,7 +452,7 @@ def main():
     success, failed = [], []
 
     with Progress(
-        TextColumn("[bold white]{task.fields[title]}", no_wrap=True, min_width=36, max_width=36),
+        TextColumn("[bold white]{task.fields[title]}"),
         BarColumn(bar_width=20),
         DownloadColumn(),
         TransferSpeedColumn(),
