@@ -123,26 +123,30 @@ class FullPipeline:
             print_info(f"[{i}/{len(json_files)}] Xử lý: {json_file.name}")
             
             try:
+                video_seg_dir = self.segments_dir / json_file.stem
                 result = subprocess.run(
-                    [sys.executable, str(splitter_script), str(json_file), str(self.segments_dir)],
+                    [sys.executable, str(splitter_script), str(json_file), str(video_seg_dir)],
                     capture_output=True,
                     text=True,
-                    timeout=3600,  # 1 hour timeout
+                    timeout=3600,
                     encoding='utf-8',
-                    errors='replace'
+                    errors='replace',
+                    cwd=str(Path(__file__).parent),  # đảm bảo import splitter_core/utils đúng
                 )
-                
+
                 if result.returncode == 0:
                     success_count += 1
-                    # Count segments created
-                    output_folder = self.segments_dir / json_file.stem
-                    if output_folder.exists():
-                        segments = list(output_folder.glob("*.mp3"))
-                        total_segments += len(segments)
-                        print_success(f"  ✅ {len(segments)} segments")
+                    segments = list(video_seg_dir.glob("*.mp3")) if video_seg_dir.exists() else []
+                    total_segments += len(segments)
+                    print_success(f"  ✅ {len(segments)} segments")
                 else:
                     failed_count += 1
-                    print_error(f"  ❌ Lỗi khi xử lý")
+                    # In ra stderr/stdout để dễ debug
+                    err = (result.stderr or result.stdout or "").strip()
+                    print_error(f"  ❌ Lỗi (returncode={result.returncode})")
+                    if err:
+                        for line in err.splitlines()[-10:]:  # 10 dòng cuối
+                            print(f"     {line}")
             
             except subprocess.TimeoutExpired:
                 failed_count += 1
