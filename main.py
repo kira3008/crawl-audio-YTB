@@ -49,16 +49,52 @@ def get_ffmpeg_dir() -> str | None:
 
 def check_dependencies():
     missing = []
-    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisper"):
+    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisper", "faster_whisper"):
         try:
             __import__(pkg)
         except ImportError:
-            install_name = "openai-whisper" if pkg == "whisper" else pkg.replace("_", "-")
+            install_name = {
+                "whisper": "openai-whisper",
+                "faster_whisper": "faster-whisper",
+            }.get(pkg, pkg.replace("_", "-"))
             missing.append(install_name)
     if missing:
         print(f"Đang cài dependencies: {', '.join(missing)} ...")
         subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
         print("Xong.\n")
+
+
+def _detect_gpu() -> bool:
+    """Trả về True nếu có NVIDIA GPU và CUDA khả dụng."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def _load_whisper_model(model_name: str):
+    """
+    Load Whisper model ưu tiên faster-whisper (GPU nếu có, fallback CPU int8).
+    Nếu faster-whisper chưa cài → dùng openai-whisper.
+    Trả về (model, backend) với backend là 'faster' hoặc 'openai'.
+    """
+    try:
+        from faster_whisper import WhisperModel
+        has_gpu = _detect_gpu()
+        if has_gpu:
+            device, compute_type = "cuda", "float16"
+        else:
+            device, compute_type = "cpu", "int8"
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        return model, "faster", device
+    except ImportError:
+        import whisper as _whisper
+        model = _whisper.load_model(model_name)
+        return model, "openai", "cpu"
 
 
 def _vi_stats(text: str) -> tuple[int, float]:
@@ -263,22 +299,34 @@ def extract_script(safe_title: str, output_dir: str) -> bool:
         return False
 
 
-def transcribe_audio(safe_title: str, output_dir: str, model) -> bool:
+def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "openai") -> bool:
     """Dùng Whisper model (đã load) nhận diện giọng nói từ MP3 → JSON [{start, end, text}]."""
     mp3_path = Path(output_dir) / f"{safe_title}.mp3"
     if not mp3_path.exists():
         return False
     try:
-        result = model.transcribe(str(mp3_path), language="vi", verbose=False)
-        entries = [
-            {
-                "start": _sec_to_hms(seg["start"]),
-                "end":   _sec_to_hms(seg["end"]),
-                "text":  seg["text"].strip(),
-            }
-            for seg in result["segments"]
-            if seg["text"].strip()
-        ]
+        if backend == "faster":
+            segments_iter, _ = model.transcribe(str(mp3_path), language="vi")
+            entries = [
+                {
+                    "start": _sec_to_hms(seg.start),
+                    "end":   _sec_to_hms(seg.end),
+                    "text":  seg.text.strip(),
+                }
+                for seg in segments_iter
+                if seg.text.strip()
+            ]
+        else:
+            result = model.transcribe(str(mp3_path), language="vi", verbose=False)
+            entries = [
+                {
+                    "start": _sec_to_hms(seg["start"]),
+                    "end":   _sec_to_hms(seg["end"]),
+                    "text":  seg["text"].strip(),
+                }
+                for seg in result["segments"]
+                if seg["text"].strip()
+            ]
         if not entries:
             return False
         json_path = Path(output_dir) / f"{safe_title}.json"
@@ -613,10 +661,11 @@ def main():
     # ── whisper transcription (sequential, single model load) ────────────────
     if success:
         from rich.progress import SpinnerColumn
-        import whisper as _whisper
 
         console.print(f"\n[bold]🎙 Load Whisper model [cyan]{whisper_model}[/cyan]…[/bold]")
-        wmodel = _whisper.load_model(whisper_model)
+        wmodel, backend, device = _load_whisper_model(whisper_model)
+        backend_label = f"faster-whisper [{device.upper()}]" if backend == "faster" else "openai-whisper [CPU]"
+        console.print(f"[dim]Backend: {backend_label}[/dim]\n")
 
         with Progress(
             SpinnerColumn(),
@@ -628,7 +677,7 @@ def main():
                 safe_title = sanitize_filename(video["title"])
                 short = video["title"][:34] + ("…" if len(video["title"]) > 34 else "")
                 wtid = wprogress.add_task("", title=short, status="[blue]🎙 Transcribing…[/blue]")
-                has_script = transcribe_audio(safe_title, output_dir, wmodel)
+                has_script = transcribe_audio(safe_title, output_dir, wmodel, backend)
                 wprogress.update(
                     wtid,
                     status="[green]✓ +script[/green]" if has_script else "[dim]không có audio[/dim]",
