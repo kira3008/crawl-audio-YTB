@@ -160,6 +160,74 @@ def search_videos(keyword: str, max_results: int) -> list[dict]:
     return videos
 
 
+# ── script extraction ────────────────────────────────────────────────────────
+
+def _ts_to_sec(ts: str) -> float:
+    """'HH:MM:SS.mmm' or 'HH:MM:SS,mmm' → float seconds."""
+    ts = ts.replace(",", ".")
+    h, m, s = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _find_vtt(output_dir: str, safe_title: str) -> Path | None:
+    """Locate the VTT subtitle file yt-dlp saved for this video."""
+    for f in Path(output_dir).iterdir():
+        if f.suffix == ".vtt":
+            # yt-dlp names subs "<title>.<lang>.vtt" → stem = "<title>.<lang>"
+            base = f.stem.rsplit(".", 1)[0] if "." in f.stem else f.stem
+            if base == safe_title:
+                return f
+    return None
+
+
+def _parse_vtt(vtt_path: Path) -> list[dict]:
+    """Parse WebVTT → [{start, end, text}], deduplicating auto-caption repeats."""
+    content = vtt_path.read_text(encoding="utf-8", errors="replace")
+
+    entries: list[dict] = []
+    # Match timestamp line + following text block
+    block_re = re.compile(
+        r"(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})[^\n]*\n"
+        r"((?:(?!\n\n|\d{2}:\d{2}:\d{2}).)+)",
+        re.DOTALL,
+    )
+    prev_text = ""
+    for m in block_re.finditer(content):
+        raw = m.group(3)
+        # strip HTML tags (e.g. <c.color>, <b>, alignment markers)
+        text = re.sub(r"<[^>]+>", "", raw)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or text == prev_text:
+            continue
+        entries.append({
+            "start": _ts_to_sec(m.group(1)),
+            "end":   _ts_to_sec(m.group(2)),
+            "text":  text,
+        })
+        prev_text = text
+
+    return entries
+
+
+def extract_script(safe_title: str, output_dir: str) -> bool:
+    """Find the downloaded VTT, convert to JSON, delete VTT. Returns True if saved."""
+    vtt = _find_vtt(output_dir, safe_title)
+    if not vtt:
+        return False
+    try:
+        entries = _parse_vtt(vtt)
+        if not entries:
+            vtt.unlink(missing_ok=True)
+            return False
+        json_path = Path(output_dir) / f"{safe_title}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+        vtt.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
 # ── download (single video) ───────────────────────────────────────────────────
 
 def download_one(
@@ -215,6 +283,11 @@ def download_one(
         "outtmpl":                        output_template,
         "progress_hooks":                 [hook],
         "concurrent_fragment_downloads":  fragments,
+        # subtitle / caption options
+        "writesubtitles":    True,   # manual subtitles
+        "writeautomaticsub": True,   # auto-generated captions (fallback)
+        "subtitleslangs":    ["vi", "vi-VN"],
+        "subtitlesformat":   "vtt",
         "quiet":       True,
         "no_warnings": True,
         "noprogress":  True,
@@ -226,6 +299,12 @@ def download_one(
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video["url"]])
+
+        # convert downloaded VTT → JSON script
+        progress.update(task_id, status="[blue]📝 Script…[/blue]")
+        has_script = extract_script(safe_title, output_dir)
+        status_final = "[green]✓ +script[/green]" if has_script else "[green]✓[/green]"
+        progress.update(task_id, status=status_final)
         return True
     except Exception:
         return False
@@ -410,10 +489,6 @@ def main():
                     ok = False
 
                 if ok:
-                    t = progress.tasks[tid]
-                    final = t.total or 1
-                    progress.update(tid, completed=final, total=final,
-                                    status="[green]✓ Xong[/green]")
                     success.append(video)
                 else:
                     progress.update(tid, status="[red]✗ Lỗi[/red]")
@@ -423,8 +498,20 @@ def main():
     if success:
         update_links_md(success, output_dir)
 
+    # count JSON script files actually saved
+    out = Path(output_dir)
+    script_count = sum(
+        1 for v in success
+        if (out / f"{sanitize_filename(v['title'])}.json").exists()
+    )
+
     # ── summary panel ─────────────────────────────────────────────────────────
     lines = [f"[green]✓ {len(success)} file MP3 đã tải[/green]"]
+    if script_count:
+        lines.append(f"[green]📝 {script_count} script JSON (có captions)[/green]")
+    no_script = len(success) - script_count
+    if no_script:
+        lines.append(f"[dim]   {no_script} video không có captions tiếng Việt[/dim]")
     if failed:
         lines.append(f"[red]✗ {len(failed)} thất bại[/red]")
     lines += [
