@@ -263,14 +263,12 @@ def extract_script(safe_title: str, output_dir: str) -> bool:
         return False
 
 
-def transcribe_audio(safe_title: str, output_dir: str, whisper_model: str) -> bool:
-    """Dùng Whisper nhận diện giọng nói từ MP3 → JSON [{start, end, text}]."""
+def transcribe_audio(safe_title: str, output_dir: str, model) -> bool:
+    """Dùng Whisper model (đã load) nhận diện giọng nói từ MP3 → JSON [{start, end, text}]."""
     mp3_path = Path(output_dir) / f"{safe_title}.mp3"
     if not mp3_path.exists():
         return False
     try:
-        import whisper
-        model = whisper.load_model(whisper_model)
         result = model.transcribe(str(mp3_path), language="vi", verbose=False)
         entries = [
             {
@@ -299,7 +297,6 @@ def download_one(
     ffmpeg_dir: str | None,
     progress,        # rich.progress.Progress (shared, thread-safe)
     task_id: int,
-    whisper_model: str = "base",
 ) -> bool:
     import yt_dlp
 
@@ -364,10 +361,7 @@ def download_one(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video["url"]])
 
-        progress.update(task_id, status="[blue]🎙 Whisper…[/blue]")
-        has_script = transcribe_audio(safe_title, output_dir, whisper_model)
-        status_final = "[green]✓ +script[/green]" if has_script else "[green]✓[/green]"
-        progress.update(task_id, status=status_final)
+        progress.update(task_id, status="[green]✓ Xong[/green]")
         return True
     except Exception:
         return False
@@ -597,7 +591,7 @@ def main():
             future_map = {
                 executor.submit(
                     download_one, v, output_dir, ffmpeg_dir,
-                    progress, task_map[v["id"]], whisper_model,
+                    progress, task_map[v["id"]],
                 ): v
                 for v in to_download
             }
@@ -615,6 +609,31 @@ def main():
                 else:
                     progress.update(tid, status="[red]✗ Lỗi[/red]")
                     failed.append(video)
+
+    # ── whisper transcription (sequential, single model load) ────────────────
+    if success:
+        from rich.progress import SpinnerColumn
+        import whisper as _whisper
+
+        console.print(f"\n[bold]🎙 Load Whisper model [cyan]{whisper_model}[/cyan]…[/bold]")
+        wmodel = _whisper.load_model(whisper_model)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold white]{task.fields[title]}", table_column=Column(min_width=36, max_width=36, no_wrap=True)),
+            TextColumn("{task.fields[status]}"),
+            console=console,
+        ) as wprogress:
+            for video in success:
+                safe_title = sanitize_filename(video["title"])
+                short = video["title"][:34] + ("…" if len(video["title"]) > 34 else "")
+                wtid = wprogress.add_task("", title=short, status="[blue]🎙 Transcribing…[/blue]")
+                has_script = transcribe_audio(safe_title, output_dir, wmodel)
+                wprogress.update(
+                    wtid,
+                    status="[green]✓ +script[/green]" if has_script else "[dim]không có audio[/dim]",
+                    completed=1, total=1,
+                )
 
     # ── markdown log ─────────────────────────────────────────────────────────
     if success:
