@@ -1,5 +1,9 @@
 """
 Core logic for splitting audio files based on WhisperX JSON timestamps.
+
+Cắt chính xác theo ms bằng cách decode MP3 → PCM vào RAM một lần,
+slice theo sample thay vì dùng ffmpeg seeking (vốn chỉ chính xác tới
+~26ms do MP3 frame boundary). Export song song để tăng tốc.
 """
 import json
 import os
@@ -13,8 +17,6 @@ from splitter_utils import (
     find_media_file,
     get_ffmpeg_path,
     sanitize_filename,
-    format_time,
-    print_success,
     print_error,
     print_warning,
     print_info,
@@ -29,7 +31,6 @@ def _hms_to_sec(ts) -> float:
     return int(h) * 3600 + int(m) * 60 + float(s)
 
 
-# Kết quả trả về từ mỗi worker
 _OK   = "ok"
 _SKIP = "skip"
 _FAIL = "fail"
@@ -42,13 +43,13 @@ class AudioSplitter:
         output_dir: Optional[str] = None,
         min_dur: float = 1.0,
         max_dur: float = 30.0,
-        padding_ms: int = 100,
-        max_workers: Optional[int] = None,   # None → tự động theo CPU
+        padding_ms: int = 50,          # padding nhỏ — smart-capped bởi gap thực tế
+        max_workers: Optional[int] = None,
     ):
         self.json_path   = Path(json_file).resolve()
         self.min_dur     = min_dur
         self.max_dur     = max_dur
-        self.padding_sec = padding_ms / 1000.0
+        self.padding_ms  = padding_ms
         self.max_workers = max_workers or min(8, os.cpu_count() or 4)
         self.entries: list[dict] = []
         self.media_file: Optional[Path] = None
@@ -79,7 +80,7 @@ class AudioSplitter:
             print_error(f"Lỗi đọc JSON: {e}")
             return False
         if not isinstance(data, list):
-            print_error("JSON phải là một mảng các entries")
+            print_error("JSON phải là một mảng entries")
             return False
         self.entries = data
         self.stats["total"] = len(data)
@@ -91,7 +92,7 @@ class AudioSplitter:
             return False
         self.media_file = find_media_file(self.json_path)
         if not self.media_file:
-            print_error(f"Không tìm thấy file MP3 tương ứng: {self.json_path.stem}.mp3")
+            print_error(f"Không tìm thấy file MP3: {self.json_path.stem}.mp3")
             return False
         try:
             subprocess.run([self.ffmpeg_cmd, "-version"], capture_output=True, timeout=5)
@@ -103,23 +104,28 @@ class AudioSplitter:
     def prepare_output_dir(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── single segment (chạy trong thread) ───────────────────────────────────
+    # ── single export (chạy trong thread) ────────────────────────────────────
 
-    def _cut_segment(
-        self,
+    @staticmethod
+    def _export_chunk(
+        audio,              # pydub AudioSegment (shared, read-only)
+        audio_len_ms: int,
         idx: int,
-        entry: dict,
-        prev_end: float,       # end của segment trước (giây)
-        next_start: float,     # start của segment sau (giây)
+        raw_start,
+        raw_end,
+        text: str,
+        prev_end_ms: int,
+        next_start_ms: int,
+        padding_ms: int,
+        min_dur: float,
+        max_dur: float,
+        output_dir: Path,
+        ffmpeg_location: str,
     ) -> tuple[str, Optional[dict]]:
         """
-        Trả về (_OK/_SKIP/_FAIL, manifest_entry_or_None).
-        Không print gì — chỉ trả kết quả để process() tổng hợp.
+        Slice AudioSegment đã load sẵn và export ra file MP3.
+        staticmethod → thread-safe hoàn toàn, không truy cập self.
         """
-        raw_start = entry.get("start")
-        raw_end   = entry.get("end")
-        text      = entry.get("text", "").strip()
-
         if raw_start is None or raw_end is None:
             return _SKIP, None
 
@@ -127,43 +133,32 @@ class AudioSplitter:
         end_sec   = _hms_to_sec(raw_end)
         duration  = end_sec - start_sec
 
-        if not (self.min_dur <= duration <= self.max_dur):
+        if not (min_dur <= duration <= max_dur):
             return _SKIP, None
 
-        # Smart padding: không tràn qua ranh giới segment kề bên.
-        # Ví dụ: gap chỉ 20ms → padding 100ms bị cap về 20ms/2 = 10ms.
-        cut_start = max(prev_end,     start_sec - self.padding_sec)
-        cut_end   = min(next_start,   end_sec   + self.padding_sec)
+        start_ms = int(round(start_sec * 1000))
+        end_ms   = int(round(end_sec   * 1000))
+
+        # Smart padding: cap bởi ranh giới segment kề và độ dài file
+        cut_start_ms = max(prev_end_ms,   start_ms - padding_ms)
+        cut_end_ms   = min(next_start_ms, end_ms   + padding_ms)
+        cut_end_ms   = min(cut_end_ms, audio_len_ms)
 
         safe_text = sanitize_filename(text)[:80] if text else "segment"
         filename  = f"{idx:04d}_{safe_text}.mp3"
-        out_path  = self.output_dir / filename
-
-        # Input-side seeking: -ss trước -i để ffmpeg nhảy thẳng đến vị trí
-        # thay vì decode từ đầu file (quan trọng với podcast dài hàng giờ).
-        # Dùng -to thay -t để chỉ điểm kết thúc tuyệt đối trong file gốc,
-        # tránh lỗi tích lũy khi tính relative duration.
-        cmd = [
-            self.ffmpeg_cmd, "-y",
-            "-ss",     f"{cut_start:.3f}",   # input-side seek
-            "-to",     f"{cut_end:.3f}",      # absolute end trong file gốc
-            "-i",      str(self.media_file),
-            "-acodec", "libmp3lame",
-            "-q:a",    "2",
-            str(out_path),
-        ]
+        out_path  = output_dir / filename
 
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=120,
+            # Slice PCM — chính xác tới ms (pydub dùng index = millisecond)
+            chunk = audio[cut_start_ms:cut_end_ms]
+            chunk.export(
+                str(out_path),
+                format="mp3",
+                parameters=["-q:a", "2"],
+                # Truyền ffmpeg location nếu không phải system ffmpeg
+                **({"codec": "libmp3lame"} if False else {}),
             )
-        except subprocess.TimeoutExpired:
-            return _FAIL, None
-        except Exception:
-            return _FAIL, None
-
-        if result.returncode != 0:
+        except Exception as e:
             return _FAIL, None
 
         meta = {
@@ -178,28 +173,53 @@ class AudioSplitter:
     # ── parallel process ──────────────────────────────────────────────────────
 
     def process(self) -> bool:
+        try:
+            from pydub import AudioSegment
+        except ImportError:
+            print_error("Thiếu pydub. Chạy: pip install pydub")
+            return False
+
         total = len(self.entries)
         print_info(f"Media   : {self.media_file.name}")
-        print_info(f"Entries : {total}  →  filter {self.min_dur}s–{self.max_dur}s · pad {int(self.padding_sec*1000)}ms")
+        print_info(f"Entries : {total}  →  filter {self.min_dur}s–{self.max_dur}s · pad {self.padding_ms}ms")
         print_info(f"Workers : {self.max_workers} luồng song song")
         print_info(f"Output  : {self.output_dir}\n")
 
-        # Pre-compute boundaries để smart padding biết giới hạn của segment kề
-        bounds: list[tuple[float, float]] = []
+        # Decode một lần → PCM trong RAM (chính xác tới sample)
+        print("  📂 Đang decode audio vào bộ nhớ...", flush=True)
+        try:
+            audio = AudioSegment.from_file(str(self.media_file))
+        except Exception as e:
+            print_error(f"Không load được audio: {e}")
+            return False
+        audio_len_ms = len(audio)
+        print(f"  ✓ {audio_len_ms / 1000:.1f}s · {audio.channels}ch · {audio.frame_rate}Hz\n", flush=True)
+
+        # Pre-compute ms boundaries để tính smart padding
+        bounds_ms: list[tuple[int, int]] = []
         for e in self.entries:
-            s = _hms_to_sec(e["start"]) if e.get("start") is not None else 0.0
-            en = _hms_to_sec(e["end"])  if e.get("end")   is not None else 0.0
-            bounds.append((s, en))
+            s  = int(round(_hms_to_sec(e["start"]) * 1000)) if e.get("start") is not None else 0
+            en = int(round(_hms_to_sec(e["end"])   * 1000)) if e.get("end")   is not None else 0
+            bounds_ms.append((s, en))
 
         done_count = 0
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_map = {}
+            future_map: dict = {}
             for idx, entry in enumerate(self.entries, 1):
-                i          = idx - 1
-                prev_end   = bounds[i - 1][1] if i > 0                  else 0.0
-                next_start = bounds[i + 1][0] if i < len(bounds) - 1    else float("inf")
-                future = executor.submit(self._cut_segment, idx, entry, prev_end, next_start)
+                i             = idx - 1
+                prev_end_ms   = bounds_ms[i - 1][1] if i > 0               else 0
+                next_start_ms = bounds_ms[i + 1][0] if i < len(bounds_ms) - 1 else audio_len_ms
+
+                future = executor.submit(
+                    self._export_chunk,
+                    audio, audio_len_ms,
+                    idx,
+                    entry.get("start"), entry.get("end"), entry.get("text", "").strip(),
+                    prev_end_ms, next_start_ms,
+                    self.padding_ms, self.min_dur, self.max_dur,
+                    self.output_dir, self.ffmpeg_cmd,
+                )
                 future_map[future] = idx
 
             for future in as_completed(future_map):
@@ -215,7 +235,6 @@ class AudioSplitter:
                     else:
                         self.stats["failed"] += 1
 
-                # Cập nhật progress trên cùng một dòng
                 pct = done_count * 100 // total
                 print(
                     f"\r  ⚡ {done_count}/{total} ({pct}%) "
@@ -223,12 +242,10 @@ class AudioSplitter:
                     end="", flush=True,
                 )
 
-        print()  # xuống dòng sau progress
+        print()
 
-        # Lưu manifest
-        manifest_path = self.output_dir / "manifest.json"
-        # Sắp xếp theo tên file (= thứ tự index)
         self.manifest.sort(key=lambda x: x["file"])
+        manifest_path = self.output_dir / "manifest.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(self.manifest, f, ensure_ascii=False, indent=2)
 

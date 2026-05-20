@@ -51,7 +51,7 @@ def get_ffmpeg_dir() -> str | None:
 
 def check_dependencies():
     missing = []
-    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisperx"):
+    for pkg in ("yt_dlp", "rich", "questionary", "imageio_ffmpeg", "whisperx", "pydub"):
         try:
             __import__(pkg)
         except ImportError:
