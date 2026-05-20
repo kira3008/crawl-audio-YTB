@@ -127,12 +127,12 @@ def format_duration(seconds) -> str:
 
 # ── search ────────────────────────────────────────────────────────────────────
 
-def search_videos(keyword: str, max_results: int) -> list[dict]:
+def search_videos(keyword: str, fetch_count: int) -> list[dict]:
+    """Fetch up to fetch_count results from YouTube search."""
     cmd = YTDLP_CMD + [
         "--dump-json", "--no-download", "--no-playlist", "--flat-playlist",
-        # tell YouTube's API to prefer Vietnamese-region results
         "--extractor-args", "youtube:lang=vi",
-        f"ytsearch{max_results}:{keyword}",
+        f"ytsearch{fetch_count}:{keyword}",
     ]
     result = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
@@ -158,6 +158,31 @@ def search_videos(keyword: str, max_results: int) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return videos
+
+
+def search_until_enough(keyword: str, needed: int, status_fn=None) -> tuple[list[dict], int]:
+    """
+    Keep expanding the fetch window until we have `needed` Vietnamese videos
+    or YouTube has no more results to give.
+
+    Returns (vi_videos[:needed], total_fetched).
+    """
+    fetch = max(int(needed * 1.5), 10)  # start 1.5× to reduce loop rounds
+    max_fetch = max(needed * 5, 100) # hard ceiling to avoid infinite loops
+    prev_total = -1
+
+    while True:
+        if status_fn:
+            status_fn(fetch)
+        all_videos = search_videos(keyword, fetch)
+        vi_videos  = [v for v in all_videos if v["is_vi"]]
+
+        # enough results or YouTube is exhausted (no new results came in)
+        if len(vi_videos) >= needed or len(all_videos) == prev_total or fetch >= max_fetch:
+            return vi_videos[:needed], len(all_videos)
+
+        prev_total = len(all_videos)
+        fetch = min(fetch + needed, max_fetch)
 
 
 # ── script extraction ────────────────────────────────────────────────────────
@@ -310,6 +335,26 @@ def download_one(
         return False
 
 
+# ── duplicate check ──────────────────────────────────────────────────────────
+
+def get_downloaded_ids(output_dir: str) -> set[str]:
+    """Return a set of video IDs already recorded in crawled_links.md."""
+    links_file = Path(output_dir) / "crawled_links.md"
+    if not links_file.exists():
+        return set()
+    content = links_file.read_text(encoding="utf-8", errors="replace")
+    # Links are written as [title](https://www.youtube.com/watch?v=ID)
+    return set(re.findall(r"watch\?v=([A-Za-z0-9_-]+)", content))
+
+
+def get_downloaded_titles(output_dir: str) -> set[str]:
+    """Return sanitized base-names of MP3 files already present in output_dir."""
+    p = Path(output_dir)
+    if not p.exists():
+        return set()
+    return {f.stem for f in p.glob("*.mp3")}
+
+
 # ── markdown log ─────────────────────────────────────────────────────────────
 
 def update_links_md(videos: list[dict], output_dir: str):
@@ -390,10 +435,14 @@ def main():
     console.print()
 
     # ── search ────────────────────────────────────────────────────────────────
-    with console.status(f"[bold green]Đang tìm kiếm '{keyword}'…[/bold green]"):
-        all_videos = search_videos(keyword, max_results)
+    with console.status("") as live_status:
+        def status_fn(fetch_count: int):
+            live_status.update(
+                f"[bold green]Đang tìm kiếm '{keyword}'… "
+                f"[dim](thử {fetch_count} kết quả)[/dim][/bold green]"
+            )
 
-    vi_videos = [v for v in all_videos if v["is_vi"]]
+        vi_videos, total_fetched = search_until_enough(keyword, max_results, status_fn)
 
     if not vi_videos:
         console.print(Panel(
@@ -403,11 +452,9 @@ def main():
         ))
         return
 
-    filtered_out = len(all_videos) - len(vi_videos)
     console.print(
         f"[green]Tìm thấy[/green] [bold]{len(vi_videos)}[/bold] video tiếng Việt "
-        f"[dim](lọc ra {filtered_out} video không phải tiếng Việt "
-        f"từ {len(all_videos)} kết quả)[/dim]\n"
+        f"[dim](quét {total_fetched} kết quả từ YouTube)[/dim]\n"
     )
 
     # ── results table ─────────────────────────────────────────────────────────
@@ -440,14 +487,37 @@ def main():
         console.print("[yellow]Không có video nào được chọn.[/yellow]")
         return
 
+    # ── skip already-downloaded ───────────────────────────────────────────────
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    existing_ids    = get_downloaded_ids(output_dir)
+    existing_titles = get_downloaded_titles(output_dir)
+
+    to_skip = [
+        v for v in selected
+        if v["id"] in existing_ids or sanitize_filename(v["title"]) in existing_titles
+    ]
+    to_download = [v for v in selected if v not in to_skip]
+
+    if to_skip:
+        skip_names = ", ".join(f"[dim]{v['title'][:40]}[/dim]" for v in to_skip)
+        console.print(
+            f"[yellow]⏭  Bỏ qua {len(to_skip)} video đã tải:[/yellow] {skip_names}\n"
+        )
+
+    if not to_download:
+        console.print(Panel(
+            "[green]Tất cả video đã được tải trước đó. Không có gì mới để tải.[/green]",
+            border_style="green", padding=(1, 4),
+        ))
+        return
+
     console.print()
     console.print(
-        f"[bold]Tải [cyan]{len(selected)}[/cyan] video · "
+        f"[bold]Tải [cyan]{len(to_download)}[/cyan] video mới · "
         f"[cyan]{max_workers}[/cyan] luồng song song[/bold]\n"
     )
 
     # ── parallel download ─────────────────────────────────────────────────────
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
     ffmpeg_dir = get_ffmpeg_dir()
     success, failed = [], []
 
@@ -464,7 +534,7 @@ def main():
 
         # register one task per video up-front so all rows appear immediately
         task_map: dict[str, int] = {}
-        for v in selected:
+        for v in to_download:
             short = v["title"][:34] + ("…" if len(v["title"]) > 34 else "")
             tid = progress.add_task(
                 "", total=None, title=short, status="[dim]Chờ…[/dim]",
@@ -477,7 +547,7 @@ def main():
                     download_one, v, output_dir, ffmpeg_dir,
                     progress, task_map[v["id"]],
                 ): v
-                for v in selected
+                for v in to_download
             }
 
             for future in as_completed(future_map):
