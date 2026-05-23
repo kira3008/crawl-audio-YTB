@@ -101,12 +101,15 @@ def _load_whisper_model(model_name: str):
 
     if _detect_gpu():
         try:
-            asr_model = whisperx.load_model(model_name, device="cuda", compute_type="int8", language="vi")
+            asr_model = whisperx.load_model(model_name, device="cuda", compute_type="int8",
+                                            language="vi", download_root=str(Path(__file__).parent / "models"))
             device = "cuda"
         except Exception:
-            asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8", language="vi")
+            asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8",
+                                            language="vi", download_root=str(Path(__file__).parent / "models"))
     else:
-        asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8", language="vi")
+        asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8",
+                                        language="vi", download_root=str(Path(__file__).parent / "models"))
 
     align_model, metadata = whisperx.load_align_model(language_code="vi", device=device)
 
@@ -306,7 +309,6 @@ def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "wh
             text = seg.get("text", "").strip()
             if not text:
                 continue
-            # Dùng word-level boundaries để timestamp chính xác hơn segment-level ASR
             words = [w for w in seg.get("words", []) if "start" in w and "end" in w]
             if words:
                 start = words[0]["start"]
@@ -318,6 +320,14 @@ def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "wh
                 "start": _sec_to_hms(start),
                 "end":   _sec_to_hms(end),
                 "text":  text,
+                "words": [
+                    {
+                        "word":  w["word"],
+                        "start": _sec_to_hms(w["start"]),
+                        "end":   _sec_to_hms(w["end"]),
+                    }
+                    for w in words
+                ],
             })
 
         if not entries:

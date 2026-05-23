@@ -1,5 +1,6 @@
 ffmpeg.exe
 downloads/
+models/
 __pycache__/
 *.pyc
 .env
