@@ -1,30 +1,13 @@
 #!/usr/bin/env python3
 """
-split_audio.py — 2-layer audio segmentation (clean architecture).
-
-Hai layer KHÔNG phụ thuộc lẫn nhau:
-
-  Layer 1 — WhisperX (text-only):
-    • Dùng entry gaps > 2s  → detect music break (đáng tin cậy)
-    • Dùng dấu .?!          → detect sentence boundary
-    • Dùng entry gap ≤ 0.2s → biết hai entry cùng hơi thở
-    → Output: "semantic groups" (danh sách entries theo câu)
-    ❌ KHÔNG dùng start/end để quyết định cut point
-
-  Layer 2 — Silero VAD (audio-only):
-    • Tìm speech boundaries chính xác ±30ms
-    → Output: danh sách (start, end) của từng speech burst
-    ❌ KHÔNG dùng text để quyết định gì
-
-  Kết hợp:
-    • Semantic group → tìm VAD boundaries bằng rough time range
-    • Cut tại VAD start/end (không phải WhisperX start/end)
+split_audio.py — cắt audio theo câu (WhisperX + Silero VAD).
 
 Usage:
     python split_audio.py                       # menu
     python split_audio.py downloads/file.json   # 1 file
     python split_audio.py downloads/            # cả thư mục
-    python split_audio.py file.json --no-vad    # fallback WhisperX
+    python split_audio.py file.json --no-vad    # chỉ dùng Whisper timestamps
+    python split_audio.py file.json --inspect   # xem cut points, không cắt
 """
 
 import argparse
@@ -34,8 +17,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def hms_to_sec(hms: str) -> float:
     h, m, s = hms.split(":")
@@ -84,7 +65,6 @@ def load_vad_model():
 
 
 def _audio_to_tensor(mp3_path: str, ffmpeg_exe: str):
-    """MP3 → 16kHz mono float32 tensor. Không dùng torchaudio."""
     import numpy as np
     import torch
     r = subprocess.run(
@@ -102,10 +82,6 @@ def run_vad(mp3_path: str, model, ffmpeg_exe: str,
             threshold: float = 0.4,
             min_speech_ms: int = 200,
             min_silence_ms: int = 200) -> list[dict]:
-    """
-    Layer 2: Silero VAD — trả về [{start, end}] tính bằng giây.
-    min_silence_ms=200: mỗi khoảng ngừng ≥200ms tạo một ranh giới.
-    """
     from silero_vad import get_speech_timestamps
     wav = _audio_to_tensor(mp3_path, ffmpeg_exe)
     return get_speech_timestamps(
@@ -118,7 +94,7 @@ def run_vad(mp3_path: str, model, ffmpeg_exe: str,
     )
 
 
-# ── Layer 1: WhisperX text-only grouping ─────────────────────────────────────
+# ── Layer 1: grouping theo câu ────────────────────────────────────────────────
 
 _SENT_END = (".", "?", "!")
 
@@ -127,15 +103,6 @@ def build_semantic_groups(entries: list[dict],
                           music_gap: float = 2.0,
                           breath_gap: float = 0.2,
                           min_duration: float = 1.0) -> list[list[dict]]:
-    """
-    Layer 1 — Chỉ dùng TEXT + ENTRY GAPS. Không dùng timestamps để cut.
-
-    Quy tắc:
-      gap > music_gap (2s)  → music break, đóng group (gap này đáng tin)
-      entry kết thúc .?!   → câu hoàn chỉnh
-      gap đến entry tiếp ≤ breath_gap (0.2s) → cùng hơi, chưa đóng
-      gap đến entry tiếp > breath_gap        → ngừng thực, đóng group
-    """
     groups: list[list[dict]] = []
     current: list[dict] = []
 
@@ -145,10 +112,8 @@ def build_semantic_groups(entries: list[dict],
             current.clear()
 
     for idx, entry in enumerate(entries):
-        # Music break → seal trước khi thêm entry mới
         if current and idx > 0:
-            gap = (hms_to_sec(entry["start"])
-                   - hms_to_sec(entries[idx - 1]["end"]))
+            gap = hms_to_sec(entry["start"]) - hms_to_sec(entries[idx - 1]["end"])
             if gap > music_gap:
                 seal()
 
@@ -169,53 +134,38 @@ def build_semantic_groups(entries: list[dict],
     return groups
 
 
-# ── Layer 2: tìm VAD boundaries cho mỗi semantic group ───────────────────────
+# ── Layer 2: VAD boundaries ───────────────────────────────────────────────────
 
 def find_vad_boundaries(group_entries: list[dict],
                         all_vad: list[dict],
-                        start_buf: float = 0.3,
-                        end_buf: float = 0.8) -> tuple[float, float]:
-    """
-    Dùng rough time range của entries để lọc VAD segments liên quan.
-    Trả về (vad_start, vad_end) chính xác — hoàn toàn từ VAD, không phải Whisper.
-
-    Lý do dùng timestamps ở đây: chỉ để LỌC VAD (tìm đúng đoạn trong file),
-    không phải làm điểm cắt. VAD start/end mới là điểm cắt thực.
-    """
+                        next_start_sec: float | None = None,
+                        start_buf: float = 0.3) -> tuple[float, float]:
     t_start = hms_to_sec(group_entries[0]["start"])
     t_end   = hms_to_sec(group_entries[-1]["end"])
 
-    # Lọc VAD có start trong [t_start - start_buf, t_end + end_buf]
-    # Dùng v["start"] để tránh lấy VAD từ music section kế bên
-    relevant = [
-        v for v in all_vad
-        if v["start"] >= t_start - start_buf and v["start"] < t_end + end_buf
-    ]
+    start_candidates = [v for v in all_vad if abs(v["start"] - t_start) <= start_buf]
+    if start_candidates:
+        vad_start = min(start_candidates, key=lambda v: abs(v["start"] - t_start))["start"]
+    else:
+        vad_start = t_start
 
-    if not relevant:
-        # Fallback: dùng WhisperX timestamps (ít chính xác nhưng có còn hơn không)
-        return t_start, t_end
+    # Dùng next_start_sec làm upper bound thay vì t_end + buffer nhỏ.
+    # WhisperX hay bị nén timestamp nên t_end không đáng tin; gap tới segment
+    # kế (music break) thì đáng tin hơn nhiều.
+    if next_start_sec is not None:
+        upper = next_start_sec - 0.3
+        end_candidates = sorted(
+            [v for v in all_vad if v["end"] >= vad_start and v["end"] <= upper],
+            key=lambda v: v["end"], reverse=True,
+        )
+    else:
+        end_candidates = sorted(
+            [v for v in all_vad if v["end"] >= t_end - 0.1 and v["end"] <= t_end + 1.5],
+            key=lambda v: v["end"],
+        )
 
-    relevant.sort(key=lambda x: x["start"])
-
-    # Tìm chuỗi VAD liên tiếp lớn nhất (loại bỏ nhảy vọt do nhạc nền)
-    chains: list[list[dict]] = []
-    cur_chain = [relevant[0]]
-    for v in relevant[1:]:
-        if v["start"] - cur_chain[-1]["end"] > 2.0:   # music gap
-            chains.append(cur_chain)
-            cur_chain = [v]
-        else:
-            cur_chain.append(v)
-    chains.append(cur_chain)
-
-    # Chọn chain có tổng overlap với [t_start, t_end] lớn nhất
-    def overlap(chain):
-        return (min(t_end, chain[-1]["end"])
-                - max(t_start, chain[0]["start"]))
-
-    best = max(chains, key=overlap)
-    return best[0]["start"], best[-1]["end"]
+    vad_end = end_candidates[0]["end"] if end_candidates else t_end + 0.15
+    return vad_start, vad_end
 
 
 # ── core splitter ─────────────────────────────────────────────────────────────
@@ -226,6 +176,8 @@ def split_one(
     ffmpeg_exe: str,
     vad_model=None,
     console=None,
+    inspect: bool = False,
+    breath_gap: float = 0.2,
 ) -> tuple[int, int]:
 
     def log(msg):
@@ -244,10 +196,11 @@ def split_one(
         log(f"[yellow]⚠ Transcript rỗng: {json_path.name}[/yellow]")
         return 0, 0
 
-    # ── Layer 1: semantic groups (text only) ──────────────────────────────────
-    sem_groups = build_semantic_groups(entries)
+    if inspect:
+        log(f"\n[bold cyan]INSPECT: {json_path.name}[/bold cyan]  (breath_gap={breath_gap}s)")
 
-    # ── Layer 2: VAD boundaries ───────────────────────────────────────────────
+    sem_groups = build_semantic_groups(entries, breath_gap=breath_gap)
+
     all_vad: list[dict] = []
     if vad_model is not None:
         try:
@@ -255,25 +208,24 @@ def split_one(
         except Exception as e:
             log(f"[yellow]⚠ VAD lỗi ({e}), dùng Whisper timestamps[/yellow]")
 
-    # ── Kết hợp: semantic group → VAD boundaries ─────────────────────────────
     all_groups: list[dict] = []
-    for sg in sem_groups:
+    for idx, sg in enumerate(sem_groups):
+        next_start_sec = (
+            hms_to_sec(sem_groups[idx + 1][0]["start"])
+            if idx + 1 < len(sem_groups) else None
+        )
         if all_vad:
-            start_sec, end_sec = find_vad_boundaries(sg, all_vad)
+            start_sec, end_sec = find_vad_boundaries(sg, all_vad,
+                                                     next_start_sec=next_start_sec)
         else:
             start_sec = hms_to_sec(sg[0]["start"])
             end_sec   = hms_to_sec(sg[-1]["end"])
 
-        all_groups.append({
-            "start_sec": start_sec,
-            "end_sec":   end_sec,
-            "entries":   sg,
-        })
+        all_groups.append({"start_sec": start_sec, "end_sec": end_sec, "entries": sg})
 
-    # ── merge groups quá ngắn ─────────────────────────────────────────────────
+    # merge groups quá ngắn (<1.5s) với group liền kề
     MIN_MS    = 1500
     MERGE_GAP = 0.8
-
     merged: list[dict] = []
     for g in all_groups:
         dur = (g["end_sec"] - g["start_sec"]) * 1000
@@ -289,9 +241,9 @@ def split_one(
         merged.append(g)
     all_groups = merged
 
-    # ── output ────────────────────────────────────────────────────────────────
     seg_dir = Path(__file__).parent / output_root / json_path.stem
-    seg_dir.mkdir(parents=True, exist_ok=True)
+    if not inspect:
+        seg_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: list[dict] = []
     ok_count = err_count = 0
@@ -306,10 +258,22 @@ def split_one(
         out_path    = seg_dir / filename
         duration_ms = round((group["end_sec"] - group["start_sec"]) * 1000)
 
+        if inspect:
+            first_word = ents[0].get("words", [{}])[0].get("word", "?")
+            last_words = ents[-1].get("words", [])
+            last_word  = last_words[-1].get("word", "?") if last_words else "?"
+            vad_note   = (f" | whisper=[{ents[0]['start']}→{ents[-1]['end']}]"
+                          f" vad=[{start}→{end}]") if all_vad else ""
+            log(f"  #{i:04d} {start}→{end} ({duration_ms}ms)"
+                f" | {len(ents)} entries | '{first_word}…{last_word}'{vad_note}")
+            log(f"         {text[:100]}")
+            ok_count += 1
+            continue
+
         cmd = [
             ffmpeg_exe, "-y", "-loglevel", "error",
-            "-i", str(mp3_path),
             "-ss", start, "-to", end,
+            "-i", str(mp3_path),
             "-c", "copy", str(out_path),
         ]
         result = subprocess.run(cmd, capture_output=True)
@@ -355,12 +319,16 @@ def collect_json_files(paths: list[Path]) -> list[Path]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="2-layer split: WhisperX text grouping + Silero VAD boundaries."
+        description="Cắt audio theo câu: WhisperX grouping + Silero VAD boundaries."
     )
     parser.add_argument("inputs", nargs="*")
     parser.add_argument("--output", "-o", default=None)
     parser.add_argument("--no-vad", action="store_true",
                         help="Dùng WhisperX timestamps (không VAD)")
+    parser.add_argument("--inspect", "-n", action="store_true",
+                        help="Dry-run: in ra cut points, không cắt file")
+    parser.add_argument("--breath-gap", type=float, default=0.2,
+                        help="Ngưỡng khoảng ngắt câu (mặc định 0.2s)")
     args = parser.parse_args()
 
     import io, sys as _sys
@@ -384,8 +352,7 @@ def main():
 
     console.print(Panel(
         "[bold cyan]Audio Segment Splitter[/bold cyan]\n"
-        "[dim]Layer 1: WhisperX text → semantic groups[/dim]\n"
-        "[dim]Layer 2: Silero VAD   → audio boundaries[/dim]",
+        "[dim]WhisperX grouping + Silero VAD boundaries[/dim]",
         border_style="cyan", padding=(0, 4),
     ))
 
@@ -455,7 +422,9 @@ def main():
                 output_root=out_root,
                 ffmpeg_exe=ffmpeg_exe,
                 vad_model=vad_model,
-                console=None,
+                console=console if args.inspect else None,
+                inspect=args.inspect,
+                breath_gap=args.breath_gap,
             )
             total_ok  += ok
             total_err += err
