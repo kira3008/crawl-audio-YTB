@@ -1,4 +1,4 @@
-from transcribe_backends import _sec_to_hms, groq_response_to_entries, plan_chunks
+from transcribe_backends import _sec_to_hms, groq_response_to_entries, plan_chunks, merge_chunk_entries
 
 
 def test_sec_to_hms_basic():
@@ -43,3 +43,12 @@ def test_plan_chunks_multiple_with_overlap():
     assert chunks[1][0] == 595.0           # lui lai overlap
     assert chunks[1][1] == 1195.0
     assert chunks[-1][1] == 1300.0         # phu het toi cuoi
+
+
+def test_merge_dedups_overlap():
+    a = [{"start": "00:00:01.000", "end": "00:00:02.000", "text": "A", "words": []},
+         {"start": "00:09:59.000", "end": "00:10:00.000", "text": "B", "words": []}]
+    b = [{"start": "00:09:59.300", "end": "00:10:00.200", "text": "B", "words": []},  # trung B
+         {"start": "00:10:05.000", "end": "00:10:06.000", "text": "C", "words": []}]
+    out = merge_chunk_entries([a, b])
+    assert [e["text"] for e in out] == ["A", "B", "C"]

@@ -21,6 +21,11 @@ def _sec_to_hms(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
+def _hms_to_sec(hms: str) -> float:
+    h, m, s = hms.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
 def _detect_gpu() -> bool:
     try:
         result = subprocess.run(
@@ -132,6 +137,26 @@ def plan_chunks(duration_sec: float, max_chunk_sec: float = 600.0,
             break
         start = end - overlap_sec
     return chunks
+
+
+def merge_chunk_entries(entry_lists: list[list[dict]]) -> list[dict]:
+    """Merge entries from multiple chunks, deduplicate overlaps.
+
+    Flattens all entries, sorts by start time, and drops entries that have
+    the same text and start time within 1.0s of the previously kept entry.
+    """
+    flat = [e for lst in entry_lists for e in lst]
+    flat.sort(key=lambda e: _hms_to_sec(e["start"]))
+    merged: list[dict] = []
+    for e in flat:
+        if merged:
+            prev = merged[-1]
+            same_text = e["text"].strip() == prev["text"].strip()
+            close = abs(_hms_to_sec(e["start"]) - _hms_to_sec(prev["start"])) < 1.0
+            if same_text and close:
+                continue
+        merged.append(e)
+    return merged
 
 
 def groq_response_to_entries(resp: dict, offset_sec: float = 0.0) -> list[dict]:
