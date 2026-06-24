@@ -3,7 +3,7 @@ from clean_transcript import (
     is_sound_tag, is_hallucination, tag_entries_heuristic,
     build_llm_prompt, apply_llm_result, llm_clean_batch,
     TYPE_DIALOGUE, TYPE_MUSIC, TYPE_SOUND, TYPE_NOISE,
-    confidence_is_noise,
+    confidence_is_noise, is_repetitive_text,
 )
 
 
@@ -117,3 +117,16 @@ def test_confidence_no_metrics_false():
 def test_confidence_good_values_false():
     assert confidence_is_noise({"no_speech_prob": 0.1, "avg_logprob": -0.2,
                                 "compression_ratio": 1.5}) is False
+
+
+def test_repetitive_true():
+    assert is_repetitive_text("la la la la") is True
+    assert is_repetitive_text("yeah yeah yeah yeah yeah") is True
+
+
+def test_repetitive_false_normal_sentence():
+    assert is_repetitive_text("Hôm nay chúng ta bàn về hạnh phúc") is False
+
+
+def test_repetitive_false_too_short():
+    assert is_repetitive_text("la la la") is False   # 3 token < nguong

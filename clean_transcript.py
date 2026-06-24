@@ -14,6 +14,9 @@ COMPRESSION_MAX = 2.4
 LOGPROB_MIN = -1.0
 LOGPROB_NOSPEECH_COMBO = 0.4
 
+REPEAT_MIN_TOKENS = 4
+REPEAT_UNIQUE_RATIO = 0.5
+
 _BRACKET_ONLY_RE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 
 _HALLUCINATION_PATTERNS = [
@@ -48,6 +51,13 @@ def confidence_is_noise(entry: dict) -> bool:
         return True
     if lp is not None and ns is not None and lp <= LOGPROB_MIN and ns >= LOGPROB_NOSPEECH_COMBO:
         return True
+
+
+def is_repetitive_text(text: str) -> bool:
+    tokens = re.findall(r"\w+", text.lower())
+    if len(tokens) < REPEAT_MIN_TOKENS:
+        return False
+    return (len(set(tokens)) / len(tokens)) <= REPEAT_UNIQUE_RATIO
     return False
 
 
