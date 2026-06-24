@@ -104,3 +104,32 @@ def transcribe_local(mp3_path: str, bundle: dict) -> list[dict]:
             ],
         })
     return entries
+
+
+def groq_response_to_entries(resp: dict, offset_sec: float = 0.0) -> list[dict]:
+    """Map Groq verbose_json response to common schema.
+
+    Reads resp["segments"], applies offset_sec, skips empty-text segments,
+    returns list of dicts with hms timestamps via _sec_to_hms.
+    """
+    entries: list[dict] = []
+    for seg in resp.get("segments", []):
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        words_out = []
+        for w in seg.get("words") or []:
+            token = w.get("word", w.get("text", ""))
+            if "start" in w and "end" in w:
+                words_out.append({
+                    "word": token,
+                    "start": _sec_to_hms(float(w["start"]) + offset_sec),
+                    "end": _sec_to_hms(float(w["end"]) + offset_sec),
+                })
+        entries.append({
+            "start": _sec_to_hms(float(seg["start"]) + offset_sec),
+            "end": _sec_to_hms(float(seg["end"]) + offset_sec),
+            "text": text,
+            "words": words_out,
+        })
+    return entries
