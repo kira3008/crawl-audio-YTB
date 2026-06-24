@@ -131,3 +131,44 @@ def clean_file(json_path, client=None) -> Path:
     out_path = json_path.with_suffix(".clean.json")
     out_path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_path
+
+
+def _collect_json(paths):
+    result = []
+    for p in paths:
+        p = Path(p)
+        if p.is_dir():
+            result.extend(f for f in sorted(p.glob("*.json"))
+                          if not f.name.endswith(".clean.json") and f.name != "manifest.json")
+        elif p.suffix.lower() == ".json" and p.exists() and not p.name.endswith(".clean.json"):
+            result.append(p)
+    return result
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Loc nhieu & chuan hoa transcript JSON.")
+    parser.add_argument("inputs", nargs="*", default=["downloads"])
+    parser.add_argument("--no-llm", action="store_true", help="Chi heuristic, khong goi Groq")
+    args = parser.parse_args()
+
+    client = None
+    if not args.no_llm:
+        try:
+            from transcribe_backends import load_groq_client
+            client = load_groq_client()
+            print("[clean] Dung LLM Groq de chuan hoa.")
+        except Exception as e:
+            print(f"[clean] Khong co Groq ({e}) -> chi heuristic.")
+
+    files = _collect_json(args.inputs or ["downloads"])
+    if not files:
+        print("Khong tim thay file JSON.")
+        return
+    for jf in files:
+        out = clean_file(jf, client=client)
+        print(f"  ✓ {jf.name} -> {out.name}")
+
+
+if __name__ == "__main__":
+    main()
