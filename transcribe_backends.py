@@ -210,7 +210,7 @@ def _extract_chunk_flac(mp3_path: str, start: float, end: float,
 
 
 def transcribe_groq(mp3_path: str, client, ffmpeg_exe: str | None,
-                    model: str = "whisper-large-v3-turbo") -> list[dict]:
+                    model: str = "whisper-large-v3") -> list[dict]:
     import tempfile
     import os
     ffmpeg = ffmpeg_exe or "ffmpeg"

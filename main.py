@@ -215,7 +215,7 @@ def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "lo
     try:
         if backend == "groq":
             from transcribe_backends import transcribe_groq
-            model_name = globals().get("_GROQ_MODEL", "whisper-large-v3-turbo")
+            model_name = globals().get("_GROQ_MODEL", "whisper-large-v3")
             entries = transcribe_groq(str(mp3_path), model, get_ffmpeg_dir(),
                                       model=model_name)
         else:
@@ -477,9 +477,9 @@ def main():
     if backend == "groq":
         groq_model_choice = questionary.select(
             "Groq Whisper model:",
-            choices=["whisper-large-v3-turbo  — nhanh nhất",
-                     "whisper-large-v3        — chính xác nhất"],
-            default="whisper-large-v3-turbo  — nhanh nhất",
+            choices=["whisper-large-v3        — chính xác nhất [mặc định]",
+                     "whisper-large-v3-turbo  — nhanh nhất"],
+            default="whisper-large-v3        — chính xác nhất [mặc định]",
         ).ask()
         if groq_model_choice is None:
             return
