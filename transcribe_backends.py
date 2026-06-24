@@ -106,6 +106,34 @@ def transcribe_local(mp3_path: str, bundle: dict) -> list[dict]:
     return entries
 
 
+def plan_chunks(duration_sec: float, max_chunk_sec: float = 600.0,
+                overlap_sec: float = 5.0) -> list[tuple[float, float]]:
+    """Split [0, duration] into windows ≤ max_chunk_sec, with overlap.
+
+    Each non-first window steps back overlap_sec to preserve context.
+    If duration <= max_chunk_sec, returns single window [0, duration].
+
+    Args:
+        duration_sec: Total audio duration in seconds.
+        max_chunk_sec: Maximum window size (default 600s).
+        overlap_sec: Overlap to step back on each new window (default 5s).
+
+    Returns:
+        List of (start, end) tuples in seconds.
+    """
+    if duration_sec <= max_chunk_sec:
+        return [(0.0, float(duration_sec))]
+    chunks: list[tuple[float, float]] = []
+    start = 0.0
+    while start < duration_sec:
+        end = min(start + max_chunk_sec, duration_sec)
+        chunks.append((start, end))
+        if end >= duration_sec:
+            break
+        start = end - overlap_sec
+    return chunks
+
+
 def groq_response_to_entries(resp: dict, offset_sec: float = 0.0) -> list[dict]:
     """Map Groq verbose_json response to common schema.
 

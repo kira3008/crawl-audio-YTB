@@ -1,4 +1,4 @@
-from transcribe_backends import _sec_to_hms, groq_response_to_entries
+from transcribe_backends import _sec_to_hms, groq_response_to_entries, plan_chunks
 
 
 def test_sec_to_hms_basic():
@@ -31,3 +31,15 @@ def test_groq_map_offset_and_missing_words():
     out = groq_response_to_entries(resp, offset_sec=600.0)
     assert out[0]["start"] == "00:10:00.000"
     assert out[0]["words"] == []
+
+
+def test_plan_chunks_single_when_short():
+    assert plan_chunks(300, max_chunk_sec=600) == [(0.0, 300.0)]
+
+
+def test_plan_chunks_multiple_with_overlap():
+    chunks = plan_chunks(1300, max_chunk_sec=600, overlap_sec=5)
+    assert chunks[0] == (0.0, 600.0)
+    assert chunks[1][0] == 595.0           # lui lai overlap
+    assert chunks[1][1] == 1195.0
+    assert chunks[-1][1] == 1300.0         # phu het toi cuoi
