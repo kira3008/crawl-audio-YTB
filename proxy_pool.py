@@ -99,8 +99,9 @@ class ProxyPool:
             if not cf.exists():
                 return 0
             data = json.loads(cf.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                self.set_alive([str(x) for x in data])
+            if not isinstance(data, list):
+                return 0
+            self.set_alive([str(x) for x in data])
         except Exception:
             return 0
         return self.alive_count()
@@ -146,9 +147,15 @@ class ProxyPool:
         self._stop.clear()
 
         def _loop():
-            self.refresh()
-            while not self._stop.wait(interval_sec):
+            try:
                 self.refresh()
+            except Exception:
+                pass
+            while not self._stop.wait(interval_sec):
+                try:
+                    self.refresh()
+                except Exception:
+                    pass
 
         self._thread = threading.Thread(target=_loop, daemon=True)
         self._thread.start()

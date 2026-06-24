@@ -178,7 +178,8 @@ def search_videos(keyword: str, fetch_count: int, proxy: str | None = None) -> l
     return videos
 
 
-def search_until_enough(keyword: str, needed: int, status_fn=None) -> tuple[list[dict], int]:
+def search_until_enough(keyword: str, needed: int, status_fn=None,
+                        proxy: str | None = None) -> tuple[list[dict], int]:
     """
     Keep expanding the fetch window until we have `needed` Vietnamese videos
     or YouTube has no more results to give.
@@ -192,7 +193,7 @@ def search_until_enough(keyword: str, needed: int, status_fn=None) -> tuple[list
     while True:
         if status_fn:
             status_fn(fetch)
-        all_videos = search_videos(keyword, fetch)
+        all_videos = search_videos(keyword, fetch, proxy=proxy)
         vi_videos  = [v for v in all_videos if v["is_vi"]]
 
         # enough results or YouTube is exhausted (no new results came in)
@@ -514,7 +515,9 @@ def main():
                 f"[dim](thử {fetch_count} kết quả)[/dim][/bold green]"
             )
 
-        vi_videos, total_fetched = search_until_enough(keyword, max_results, status_fn)
+        search_proxy = pool.get_proxy() if pool is not None else None
+        vi_videos, total_fetched = search_until_enough(keyword, max_results, status_fn,
+                                                       proxy=search_proxy)
 
     if not vi_videos:
         console.print(Panel(

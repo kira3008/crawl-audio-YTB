@@ -269,7 +269,8 @@ def split_one(
         duration_ms = round((group["end_sec"] - group["start_sec"]) * 1000)
 
         if inspect:
-            first_word = ents[0].get("words", [{}])[0].get("word", "?")
+            first_words = ents[0].get("words") or []
+            first_word  = first_words[0].get("word", "?") if first_words else "?"
             last_words = ents[-1].get("words", [])
             last_word  = last_words[-1].get("word", "?") if last_words else "?"
             vad_note   = (f" | whisper=[{ents[0]['start']}→{ents[-1]['end']}]"

@@ -216,7 +216,14 @@ def transcribe_groq(mp3_path: str, client, ffmpeg_exe: str | None,
                     _extract_chunk_flac(mp3_path, start, end, ffmpeg, flac)
                     src = flac
                 else:
-                    src = mp3_path
+                    # duration unknown: downsample whole file to stay under Groq size limit
+                    subprocess.run(
+                        [ffmpeg, "-y", "-loglevel", "error",
+                         "-i", mp3_path,
+                         "-ar", "16000", "-ac", "1", "-c:a", "flac", flac],
+                        check=True, capture_output=True,
+                    )
+                    src = flac
                 with open(src, "rb") as fh:
                     resp = client.audio.transcriptions.create(
                         model=model, file=(os.path.basename(src), fh.read()),

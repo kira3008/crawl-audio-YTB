@@ -9,7 +9,6 @@ TYPE_MUSIC = "music"
 TYPE_SOUND = "sound"
 TYPE_NOISE = "noise"
 
-_SOUND_TAG_RE = re.compile(r"[♪♫\U0001F3B5]|\[[^\]]*\]")
 _BRACKET_ONLY_RE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 
 _HALLUCINATION_PATTERNS = [
