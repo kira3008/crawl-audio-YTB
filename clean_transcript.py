@@ -51,6 +51,7 @@ def confidence_is_noise(entry: dict) -> bool:
         return True
     if lp is not None and ns is not None and lp <= LOGPROB_MIN and ns >= LOGPROB_NOSPEECH_COMBO:
         return True
+    return False
 
 
 def is_repetitive_text(text: str) -> bool:
@@ -58,7 +59,6 @@ def is_repetitive_text(text: str) -> bool:
     if len(tokens) < REPEAT_MIN_TOKENS:
         return False
     return (len(set(tokens)) / len(tokens)) <= REPEAT_UNIQUE_RATIO
-    return False
 
 
 def _norm_key(text: str) -> str:
