@@ -134,7 +134,7 @@ def test_repetitive_false_too_short():
 
 def test_near_dup_true():
     from clean_transcript import _is_near_dup
-    assert _is_near_dup("la la la", "la la la la") is True
+    assert _is_near_dup("la la la la", "la la la la la") is True   # ratio 0.88
 
 
 def test_near_dup_false():
