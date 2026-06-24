@@ -1,6 +1,7 @@
 """clean_transcript.py — loc nhieu & chuan hoa transcript (heuristic + LLM Groq)."""
 
 import re
+import json
 
 TYPE_DIALOGUE = "dialogue"
 TYPE_MUSIC = "music"
@@ -65,3 +66,48 @@ def tag_entries_heuristic(entries: list[dict], repeat_threshold: int = 3) -> lis
                     out[k]["type"] = TYPE_MUSIC
         i = j + 1
     return out
+
+
+def build_llm_prompt(batch: list[dict]) -> str:
+    lines = [f"{i}: {e.get('text_raw', e.get('text',''))}" for i, e in enumerate(batch)]
+    return (
+        "Bạn là bộ lọc transcript tiếng Việt. Với mỗi dòng dưới đây, "
+        "phân loại 'type' là một trong: dialogue (lời thoại/nội dung nói), "
+        "music (lời bài hát/giai điệu), noise (câu thừa, hallucination, "
+        "lời chào câu view không thuộc nội dung). Đồng thời chuẩn hóa 'text': "
+        "sửa dấu câu, viết hoa đầu câu, bỏ từ đệm lặp. "
+        "Trả về JSON: {\"items\": [{\"index\": int, \"type\": str, \"text\": str}, ...]}.\n\n"
+        + "\n".join(lines)
+    )
+
+
+def apply_llm_result(batch: list[dict], result: list[dict]) -> list[dict]:
+    out = [dict(e) for e in batch]
+    for item in result:
+        try:
+            idx = int(item["index"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if 0 <= idx < len(out):
+            if item.get("type") in (TYPE_DIALOGUE, TYPE_MUSIC, TYPE_SOUND, TYPE_NOISE):
+                out[idx]["type"] = item["type"]
+            if isinstance(item.get("text"), str) and item["text"].strip():
+                out[idx]["text"] = item["text"].strip()
+    return out
+
+
+def llm_clean_batch(client, batch: list[dict],
+                    model: str = "llama-3.1-8b-instant") -> list[dict]:
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": build_llm_prompt(batch)}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        content = resp.choices[0].message.content
+        data = json.loads(content)
+        items = data.get("items", data if isinstance(data, list) else [])
+        return apply_llm_result(batch, items)
+    except Exception:
+        return batch

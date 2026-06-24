@@ -1,5 +1,7 @@
+import json
 from clean_transcript import (
     is_sound_tag, is_hallucination, tag_entries_heuristic,
+    build_llm_prompt, apply_llm_result, llm_clean_batch,
     TYPE_DIALOGUE, TYPE_MUSIC, TYPE_SOUND, TYPE_NOISE,
 )
 
@@ -34,3 +36,36 @@ def test_tag_repetition_as_music():
     entries = [_e("la la la"), _e("la la la"), _e("la la la")]
     out = tag_entries_heuristic(entries, repeat_threshold=3)
     assert all(o["type"] == TYPE_MUSIC for o in out)
+
+
+def _te(text, typ="dialogue"):
+    return {"start": "00:00:00.000", "end": "00:00:01.000",
+            "text": text, "text_raw": text, "type": typ, "words": []}
+
+
+def test_build_prompt_lists_indexes():
+    p = build_llm_prompt([_te("Xin chao"), _te("la la la")])
+    assert "0" in p and "Xin chao" in p and "la la la" in p
+
+
+def test_apply_llm_result_updates():
+    batch = [_te("xin chao cac ban"), _te("la la la")]
+    result = [{"index": 0, "type": "dialogue", "text": "Xin chào các bạn."},
+              {"index": 1, "type": "music", "text": "la la la"}]
+    out = apply_llm_result(batch, result)
+    assert out[0]["text"] == "Xin chào các bạn."
+    assert out[0]["type"] == "dialogue"
+    assert out[1]["type"] == "music"
+    assert out[0]["text_raw"] == "xin chao cac ban"     # giu goc
+
+
+def test_llm_clean_batch_error_returns_input(monkeypatch):
+    class BadClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**k):
+                    raise RuntimeError("boom")
+    batch = [_te("a")]
+    out = llm_clean_batch(BadClient(), batch)
+    assert out == batch
