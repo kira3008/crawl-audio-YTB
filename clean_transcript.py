@@ -2,6 +2,7 @@
 
 import re
 import json
+from pathlib import Path
 
 TYPE_DIALOGUE = "dialogue"
 TYPE_MUSIC = "music"
@@ -111,3 +112,22 @@ def llm_clean_batch(client, batch: list[dict],
         return apply_llm_result(batch, items)
     except Exception:
         return batch
+
+
+def clean_entries(entries: list[dict], client=None, batch_size: int = 40) -> list[dict]:
+    tagged = tag_entries_heuristic(entries)
+    if client is None:
+        return tagged
+    out: list[dict] = []
+    for i in range(0, len(tagged), batch_size):
+        out.extend(llm_clean_batch(client, tagged[i:i + batch_size]))
+    return out
+
+
+def clean_file(json_path, client=None) -> Path:
+    json_path = Path(json_path)
+    entries = json.loads(json_path.read_text(encoding="utf-8"))
+    cleaned = clean_entries(entries, client=client)
+    out_path = json_path.with_suffix(".clean.json")
+    out_path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path

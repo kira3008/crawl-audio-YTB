@@ -69,3 +69,27 @@ def test_llm_clean_batch_error_returns_input(monkeypatch):
     batch = [_te("a")]
     out = llm_clean_batch(BadClient(), batch)
     assert out == batch
+
+
+def test_clean_entries_heuristic_only():
+    from clean_transcript import clean_entries
+    entries = [{"start": "00:00:00.000", "end": "00:00:01.000", "text": "[Âm nhạc]", "words": []},
+               {"start": "00:00:01.000", "end": "00:00:02.000", "text": "Xin chào", "words": []}]
+    out = clean_entries(entries, client=None)
+    assert out[0]["type"] == "sound"
+    assert out[1]["type"] == "dialogue"
+
+
+def test_clean_file_writes_clean_json(tmp_path):
+    from pathlib import Path
+    from clean_transcript import clean_file
+    src = tmp_path / "a.json"
+    src.write_text(json.dumps(
+        [{"start": "00:00:00.000", "end": "00:00:01.000", "text": "Xin chào", "words": []}],
+        ensure_ascii=False), encoding="utf-8")
+    out = clean_file(src, client=None)
+    assert out == tmp_path / "a.clean.json"
+    assert out.exists()
+    assert src.exists()      # goc khong bi dung
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data[0]["type"] == "dialogue"
