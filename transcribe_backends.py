@@ -159,6 +159,78 @@ def merge_chunk_entries(entry_lists: list[list[dict]]) -> list[dict]:
     return merged
 
 
+def load_groq_client():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    import os
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("Thieu GROQ_API_KEY")
+    from groq import Groq
+    return Groq(api_key=key)
+
+
+def _probe_duration(mp3_path: str, ffmpeg_exe: str) -> float:
+    import re
+    r = subprocess.run(
+        [ffmpeg_exe, "-i", mp3_path, "-hide_banner"],
+        capture_output=True, text=True, errors="replace",
+    )
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", r.stderr)
+    if not m:
+        return 0.0
+    h, mn, s = m.groups()
+    return int(h) * 3600 + int(mn) * 60 + float(s)
+
+
+def _extract_chunk_flac(mp3_path: str, start: float, end: float,
+                        ffmpeg_exe: str, out_path: str) -> str:
+    subprocess.run(
+        [ffmpeg_exe, "-y", "-loglevel", "error",
+         "-ss", str(start), "-to", str(end), "-i", mp3_path,
+         "-ar", "16000", "-ac", "1", "-c:a", "flac", out_path],
+        check=True, capture_output=True,
+    )
+    return out_path
+
+
+def transcribe_groq(mp3_path: str, client, ffmpeg_exe: str | None,
+                    model: str = "whisper-large-v3-turbo") -> list[dict]:
+    import tempfile
+    import os
+    ffmpeg = ffmpeg_exe or "ffmpeg"
+    if ffmpeg and Path(ffmpeg).is_dir():
+        ffmpeg = str(Path(ffmpeg) / "ffmpeg.exe")
+    duration = _probe_duration(mp3_path, ffmpeg)
+    windows = plan_chunks(duration) if duration > 0 else [(0.0, 0.0)]
+
+    entry_lists: list[list[dict]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (start, end) in enumerate(windows):
+            flac = os.path.join(tmp, f"chunk_{i}.flac")
+            try:
+                if end > start:
+                    _extract_chunk_flac(mp3_path, start, end, ffmpeg, flac)
+                    src = flac
+                else:
+                    src = mp3_path
+                with open(src, "rb") as fh:
+                    resp = client.audio.transcriptions.create(
+                        model=model, file=(os.path.basename(src), fh.read()),
+                        language="vi", response_format="verbose_json",
+                        timestamp_granularities=["segment", "word"],
+                    )
+                data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+                entry_lists.append(groq_response_to_entries(data, offset_sec=start))
+            except Exception as e:
+                logging.error(f"[groq] chunk {i} loi: {e}")
+                continue
+    return merge_chunk_entries(entry_lists)
+
+
 def groq_response_to_entries(resp: dict, offset_sec: float = 0.0) -> list[dict]:
     """Map Groq verbose_json response to common schema.
 

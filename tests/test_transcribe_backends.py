@@ -1,3 +1,4 @@
+import transcribe_backends as tb
 from transcribe_backends import _sec_to_hms, groq_response_to_entries, plan_chunks, merge_chunk_entries
 
 
@@ -52,3 +53,51 @@ def test_merge_dedups_overlap():
          {"start": "00:10:05.000", "end": "00:10:06.000", "text": "C", "words": []}]
     out = merge_chunk_entries([a, b])
     assert [e["text"] for e in out] == ["A", "B", "C"]
+
+
+class FakeTranscriptions:
+    def __init__(self, payloads):
+        self._payloads = payloads
+        self.calls = 0
+
+    def create(self, **kwargs):
+        idx = self.calls
+        self.calls += 1
+        class R:
+            def model_dump(self_inner):
+                return self._payloads[idx]
+        return R()
+
+
+class FakeAudio:
+    def __init__(self, payloads):
+        self.transcriptions = FakeTranscriptions(payloads)
+
+
+class FakeClient:
+    def __init__(self, payloads):
+        self.audio = FakeAudio(payloads)
+
+
+def test_transcribe_groq_two_chunks(monkeypatch, tmp_path):
+    mp3 = tmp_path / "a.mp3"
+    mp3.write_bytes(b"x")
+
+    # duration 1300s -> 3 chunk (600 / 595->1195 / 1190->1300)
+    monkeypatch.setattr(tb, "_probe_duration", lambda *a, **k: 1300.0)
+    # moi chunk tao file flac gia + tra 1 segment
+    def _fake_extract(mp3p, start, end, ffmpeg, outp):
+        open(outp, "wb").close()
+        return outp
+    monkeypatch.setattr(tb, "_extract_chunk_flac", _fake_extract)
+    payloads = [
+        {"segments": [{"start": 0.0, "end": 1.0, "text": "chunk0"}]},
+        {"segments": [{"start": 0.0, "end": 1.0, "text": "chunk1"}]},
+        {"segments": [{"start": 0.0, "end": 1.0, "text": "chunk2"}]},
+    ]
+    client = FakeClient(payloads)
+    out = tb.transcribe_groq(str(mp3), client, "ffmpeg", model="whisper-large-v3")
+    texts = [e["text"] for e in out]
+    assert texts == ["chunk0", "chunk1", "chunk2"]
+    # offset ap dung: chunk1 bat dau ~595s
+    assert out[1]["start"].startswith("00:09:5")
