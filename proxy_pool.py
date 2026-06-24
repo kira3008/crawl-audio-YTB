@@ -1,6 +1,7 @@
 """proxy_pool.py — fetch, validate, xoay proxy free/custom cho yt-dlp."""
 
 import re
+import threading
 
 _IPPORT_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}:\d{2,5}$")
 _SCHEME_RE = re.compile(r"^[a-z0-9]+://", re.IGNORECASE)
@@ -28,3 +29,49 @@ def parse_proxy_lines(text: str) -> list[str]:
             seen.add(p)
             out.append(p)
     return out
+
+
+DEFAULT_SOURCES = [
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+]
+
+
+class ProxyPool:
+    def __init__(self, sources=None, custom_file="proxies.txt",
+                 cache_file="proxy_cache.json",
+                 validate_url="https://www.youtube.com", timeout=5.0):
+        self.sources = DEFAULT_SOURCES if sources is None else list(sources)
+        self.custom_file = custom_file
+        self.cache_file = cache_file
+        self.validate_url = validate_url
+        self.timeout = timeout
+        self._alive: list[str] = []
+        self._idx = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def set_alive(self, proxies: list[str]) -> None:
+        with self._lock:
+            self._alive = list(proxies)
+            self._idx = 0
+
+    def alive_count(self) -> int:
+        with self._lock:
+            return len(self._alive)
+
+    def get_proxy(self) -> str | None:
+        with self._lock:
+            if not self._alive:
+                return None
+            proxy = self._alive[self._idx % len(self._alive)]
+            self._idx += 1
+            return proxy
+
+    def mark_bad(self, proxy: str) -> None:
+        with self._lock:
+            if proxy in self._alive:
+                self._alive.remove(proxy)
+                self._idx = 0
