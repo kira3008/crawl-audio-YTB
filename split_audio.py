@@ -168,6 +168,16 @@ def find_vad_boundaries(group_entries: list[dict],
     return vad_start, vad_end
 
 
+# ── entry loader ─────────────────────────────────────────────────────────────
+
+def load_entries_for_split(json_path: Path) -> list[dict]:
+    clean = json_path.with_suffix(".clean.json")
+    if clean.exists():
+        data = json.loads(clean.read_text(encoding="utf-8"))
+        return [e for e in data if e.get("type", "dialogue") == "dialogue"]
+    return json.loads(json_path.read_text(encoding="utf-8"))
+
+
 # ── core splitter ─────────────────────────────────────────────────────────────
 
 def split_one(
@@ -191,7 +201,7 @@ def split_one(
         log(f"[red]✗ Không tìm thấy MP3: {mp3_path.name}[/red]")
         return 0, 1
 
-    entries: list[dict] = json.loads(json_path.read_text(encoding="utf-8"))
+    entries: list[dict] = load_entries_for_split(json_path)
     if not entries:
         log(f"[yellow]⚠ Transcript rỗng: {json_path.name}[/yellow]")
         return 0, 0
