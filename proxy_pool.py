@@ -141,3 +141,20 @@ class ProxyPool:
             except Exception:
                 continue
         return alive
+
+    def start_background(self, interval_sec: int = 600) -> None:
+        self._stop.clear()
+
+        def _loop():
+            self.refresh()
+            while not self._stop.wait(interval_sec):
+                self.refresh()
+
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def stop_background(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None

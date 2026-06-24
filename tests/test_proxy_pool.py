@@ -1,4 +1,5 @@
 import json
+import threading as _th
 
 import proxy_pool as pp
 from proxy_pool import normalize_proxy, parse_proxy_lines, ProxyPool
@@ -109,3 +110,19 @@ def test_refresh_validates_and_caches(tmp_path, monkeypatch):
     assert n == 1
     assert p.alive_count() == 1
     assert json.loads(cache.read_text(encoding="utf-8")) == ["http://a:1"]
+
+
+def test_background_runs_initial_refresh(monkeypatch):
+    p = pp.ProxyPool(sources=[], custom_file=None, cache_file=None)
+    called = _th.Event()
+
+    def fake_refresh():
+        p.set_alive(["http://a:1"])
+        called.set()
+        return 1
+
+    monkeypatch.setattr(p, "refresh", fake_refresh)
+    p.start_background(interval_sec=999)
+    assert called.wait(timeout=3.0)      # refresh lan dau chay ngay
+    p.stop_background()
+    assert p.alive_count() == 1
