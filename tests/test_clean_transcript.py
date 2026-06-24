@@ -219,3 +219,22 @@ def test_prompt_has_heuristic_label_and_examples():
 def test_llm_clean_batch_default_model_is_70b():
     sig = inspect.signature(llm_clean_batch)
     assert sig.parameters["model"].default == "llama-3.3-70b-versatile"
+
+
+# --- Fix A: short backchannels must not be demoted by global-frequency ---
+
+def test_tag_short_backchannel_not_demoted():
+    entries = []
+    for i in range(4):
+        entries.append(_em("Vâng"))
+        entries.append(_em(f"Đây là một câu thoại khác số {i} hoàn toàn riêng biệt"))
+    out = tag_entries_heuristic(entries)
+    vang = [o for o in out if o["text_raw"] == "Vâng"]
+    assert len(vang) == 4
+    assert all(o["type"] == TYPE_DIALOGUE for o in vang)
+
+
+# --- Fix B: non-numeric metric must not raise ---
+
+def test_confidence_non_numeric_metric_no_raise():
+    assert confidence_is_noise({"no_speech_prob": "high"}) is False

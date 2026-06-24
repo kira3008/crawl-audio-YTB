@@ -21,6 +21,7 @@ REPEAT_UNIQUE_RATIO = 0.5
 
 SIM_THRESHOLD = 0.85
 GLOBAL_FREQ_MIN = 4
+GLOBAL_PHRASE_MIN_WORDS = 3
 GLOBAL_PHRASE_MAX_WORDS = 12
 
 _BRACKET_ONLY_RE = re.compile(r"^\s*\[[^\]]*\]\s*$")
@@ -47,10 +48,14 @@ def is_hallucination(text: str) -> bool:
     return any(p in low for p in _HALLUCINATION_PATTERNS)
 
 
+def _num(v):
+    return v if isinstance(v, (int, float)) else None
+
+
 def confidence_is_noise(entry: dict) -> bool:
-    ns = entry.get("no_speech_prob")
-    cr = entry.get("compression_ratio")
-    lp = entry.get("avg_logprob")
+    ns = _num(entry.get("no_speech_prob"))
+    cr = _num(entry.get("compression_ratio"))
+    lp = _num(entry.get("avg_logprob"))
     if ns is not None and ns >= NO_SPEECH_MAX:
         return True
     if cr is not None and cr >= COMPRESSION_MAX:
@@ -79,7 +84,7 @@ def find_global_music_keys(entries: list[dict]) -> set[str]:
     counts: Counter = Counter()
     for e in entries:
         key = _norm_key(e.get("text_raw", e.get("text", "")))
-        if key and 1 <= len(key.split()) <= GLOBAL_PHRASE_MAX_WORDS:
+        if key and GLOBAL_PHRASE_MIN_WORDS <= len(key.split()) <= GLOBAL_PHRASE_MAX_WORDS:
             counts[key] += 1
     return {k for k, c in counts.items() if c >= GLOBAL_FREQ_MIN}
 
@@ -116,6 +121,7 @@ def tag_entries_heuristic(entries: list[dict], repeat_threshold: int = 3) -> lis
     while i < n:
         j = i
         ki = _norm_key(out[i]["text_raw"])
+        # skip empty/whitespace keys: SequenceMatcher("","") == 1.0 and would falsely group blank entries
         while j + 1 < n and ki and _is_near_dup(ki, _norm_key(out[j + 1]["text_raw"])):
             j += 1
         if (j - i + 1) >= repeat_threshold:
