@@ -9,6 +9,8 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from transcribe_backends import load_local_model, transcribe_local
+
 YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]
 STALL_SECONDS = 60  # seconds without byte progress → show stall warning
 
@@ -72,49 +74,6 @@ def check_dependencies():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "whisperx"])
         print("Cài whisperx xong.\n")
 
-
-def _detect_gpu() -> bool:
-    """Trả về True nếu có NVIDIA GPU và CUDA khả dụng."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.returncode == 0 and bool(result.stdout.strip())
-    except Exception:
-        return False
-
-
-def _load_whisper_model(model_name: str):
-    """
-    Load WhisperX (GPU nếu có, fallback CPU int8).
-    Trả về (bundle, backend, device) với:
-      bundle = {"asr": model, "align": align_model, "meta": metadata, "device": device}
-      backend = "whisperx"
-    """
-    import warnings
-    warnings.filterwarnings("ignore", message="torchcodec is not installed")
-    import whisperx
-
-    device = "cpu"
-    compute_type = "int8"
-
-    if _detect_gpu():
-        try:
-            asr_model = whisperx.load_model(model_name, device="cuda", compute_type="int8",
-                                            language="vi", download_root=str(Path(__file__).parent / "models"))
-            device = "cuda"
-        except Exception:
-            asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8",
-                                            language="vi", download_root=str(Path(__file__).parent / "models"))
-    else:
-        asr_model = whisperx.load_model(model_name, device="cpu", compute_type="int8",
-                                        language="vi", download_root=str(Path(__file__).parent / "models"))
-
-    align_model, metadata = whisperx.load_align_model(language_code="vi", device=device)
-
-    bundle = {"asr": asr_model, "align": align_model, "meta": metadata, "device": device}
-    return bundle, "whisperx", device
 
 
 def _vi_stats(text: str) -> tuple[int, float]:
@@ -246,102 +205,27 @@ def search_until_enough(keyword: str, needed: int, status_fn=None) -> tuple[list
 
 # ── transcription ────────────────────────────────────────────────────────────
 
-def _sec_to_hms(sec: float) -> str:
-    """float seconds → 'hh:mm:ss.mmm'."""
-    ms = round((sec % 1) * 1000)
-    total = int(sec)
-    if ms == 1000:
-        ms = 0
-        total += 1
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-
-
-def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "whisperx") -> bool:
-    """Dùng WhisperX + PhoWhisper nhận diện giọng nói từ MP3 → JSON [{start, end, text}].
-    Alignment bước 2 căn chỉnh timestamp chính xác theo audio thực tế.
-    """
+def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "local") -> bool:
     import logging
     mp3_path = Path(output_dir) / f"{safe_title}.mp3"
     if not mp3_path.exists():
         logging.warning(f"[transcribe] MP3 not found: {mp3_path}")
         return False
     try:
-        import whisperx
-
-        bundle = model  # {"asr", "align", "meta", "device"}
-        device = bundle["device"]
-        batch_size = 16 if device == "cuda" else 4
-
-        audio = whisperx.load_audio(str(mp3_path))
-
-        # Bước 1: nhận diện văn bản, tự giảm batch_size nếu OOM
-        result = None
-        while batch_size >= 1:
-            try:
-                import torch
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-                result = bundle["asr"].transcribe(audio, batch_size=batch_size, language="vi")
-                break
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower() and batch_size > 1:
-                    batch_size = batch_size // 2
-                    logging.warning(f"[transcribe] OOM — giảm batch_size xuống {batch_size}")
-                else:
-                    raise
-        if result is None:
-            return False
-
-        # Bước 2: căn chỉnh timestamp khớp chính xác với audio
-        aligned = whisperx.align(
-            result["segments"],
-            bundle["align"],
-            bundle["meta"],
-            audio,
-            device=device,
-            return_char_alignments=False,
-        )
-
-        entries = []
-        for seg in aligned["segments"]:
-            text = seg.get("text", "").strip()
-            if not text:
-                continue
-            words = [w for w in seg.get("words", []) if "start" in w and "end" in w]
-            if words:
-                start = words[0]["start"]
-                end   = words[-1]["end"]
-            else:
-                start = seg["start"]
-                end   = seg["end"]
-            entries.append({
-                "start": _sec_to_hms(start),
-                "end":   _sec_to_hms(end),
-                "text":  text,
-                "words": [
-                    {
-                        "word":  w["word"],
-                        "start": _sec_to_hms(w["start"]),
-                        "end":   _sec_to_hms(w["end"]),
-                    }
-                    for w in words
-                ],
-            })
-
+        if backend == "groq":
+            from transcribe_backends import transcribe_groq
+            entries = transcribe_groq(str(mp3_path), model, get_ffmpeg_dir())
+        else:
+            entries = transcribe_local(str(mp3_path), model)
         if not entries:
-            logging.warning(f"[transcribe] No segments found in: {mp3_path}")
+            logging.warning(f"[transcribe] No segments: {mp3_path}")
             return False
-
         json_path = Path(output_dir) / f"{safe_title}.json"
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(entries, f, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
-        logging.error(f"[transcribe] Error transcribing {mp3_path}: {e}", exc_info=True)
+        logging.error(f"[transcribe] Error {mp3_path}: {e}", exc_info=True)
         return False
 
 
@@ -673,7 +557,9 @@ def main():
 
     # ── load model trước download để pipeline kịp thời ───────────────────────
     console.print(f"\n[bold]🎙 Load Whisper model [cyan]{whisper_model}[/cyan]…[/bold]")
-    wmodel, backend, device = _load_whisper_model(whisper_model)
+    wmodel = load_local_model(whisper_model)
+    device = wmodel["device"]
+    backend = "local"
     console.print(f"[dim]Backend: WhisperX [{device.upper()}] + alignment vi[/dim]\n")
 
     # ── parallel download + pipeline transcription ────────────────────────────
