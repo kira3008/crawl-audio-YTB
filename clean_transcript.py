@@ -9,6 +9,11 @@ TYPE_MUSIC = "music"
 TYPE_SOUND = "sound"
 TYPE_NOISE = "noise"
 
+NO_SPEECH_MAX = 0.6
+COMPRESSION_MAX = 2.4
+LOGPROB_MIN = -1.0
+LOGPROB_NOSPEECH_COMBO = 0.4
+
 _BRACKET_ONLY_RE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 
 _HALLUCINATION_PATTERNS = [
@@ -31,6 +36,19 @@ def is_sound_tag(text: str) -> bool:
 def is_hallucination(text: str) -> bool:
     low = text.lower()
     return any(p in low for p in _HALLUCINATION_PATTERNS)
+
+
+def confidence_is_noise(entry: dict) -> bool:
+    ns = entry.get("no_speech_prob")
+    cr = entry.get("compression_ratio")
+    lp = entry.get("avg_logprob")
+    if ns is not None and ns >= NO_SPEECH_MAX:
+        return True
+    if cr is not None and cr >= COMPRESSION_MAX:
+        return True
+    if lp is not None and ns is not None and lp <= LOGPROB_MIN and ns >= LOGPROB_NOSPEECH_COMBO:
+        return True
+    return False
 
 
 def _norm_key(text: str) -> str:

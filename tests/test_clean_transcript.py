@@ -3,6 +3,7 @@ from clean_transcript import (
     is_sound_tag, is_hallucination, tag_entries_heuristic,
     build_llm_prompt, apply_llm_result, llm_clean_batch,
     TYPE_DIALOGUE, TYPE_MUSIC, TYPE_SOUND, TYPE_NOISE,
+    confidence_is_noise,
 )
 
 
@@ -93,3 +94,26 @@ def test_clean_file_writes_clean_json(tmp_path):
     assert src.exists()      # goc khong bi dung
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data[0]["type"] == "dialogue"
+
+
+def test_confidence_high_no_speech():
+    assert confidence_is_noise({"no_speech_prob": 0.7}) is True
+
+
+def test_confidence_high_compression():
+    assert confidence_is_noise({"compression_ratio": 2.5}) is True
+
+
+def test_confidence_logprob_combo():
+    assert confidence_is_noise({"avg_logprob": -1.2, "no_speech_prob": 0.5}) is True
+    # logprob thap nhung no_speech thap -> khong demote (than trong)
+    assert confidence_is_noise({"avg_logprob": -1.2, "no_speech_prob": 0.1}) is False
+
+
+def test_confidence_no_metrics_false():
+    assert confidence_is_noise({"text": "Xin chào"}) is False
+
+
+def test_confidence_good_values_false():
+    assert confidence_is_noise({"no_speech_prob": 0.1, "avg_logprob": -0.2,
+                                "compression_ratio": 1.5}) is False
