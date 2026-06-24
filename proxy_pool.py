@@ -2,6 +2,7 @@
 
 import re
 import threading
+import requests
 
 _IPPORT_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}:\d{2,5}$")
 _SCHEME_RE = re.compile(r"^[a-z0-9]+://", re.IGNORECASE)
@@ -75,3 +76,35 @@ class ProxyPool:
             if proxy in self._alive:
                 self._alive.remove(proxy)
                 self._idx = 0
+
+    def _fetch_raw(self) -> list[str]:
+        lines: list[str] = []
+        if self.custom_file:
+            try:
+                from pathlib import Path
+                cf = Path(self.custom_file)
+                if cf.exists():
+                    lines.extend(cf.read_text(encoding="utf-8", errors="replace").splitlines())
+            except Exception:
+                pass
+        for src in self.sources:
+            try:
+                r = requests.get(src, timeout=self.timeout)
+                if r.status_code == 200:
+                    lines.extend(r.text.splitlines())
+            except Exception:
+                continue
+        return parse_proxy_lines("\n".join(lines))
+
+    def _validate(self, proxies: list[str]) -> list[str]:
+        alive: list[str] = []
+        for px in proxies:
+            try:
+                r = requests.get(self.validate_url,
+                                 proxies={"http": px, "https": px},
+                                 timeout=self.timeout)
+                if r.status_code == 200:
+                    alive.append(px)
+            except Exception:
+                continue
+        return alive
