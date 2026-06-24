@@ -8,6 +8,9 @@ Công cụ chạy trên terminal, tự động tìm kiếm video tiếng Việt 
 - Tự động lọc video tiếng Việt
 - Tải âm thanh và convert sang MP3
 - Lưu danh sách link đã crawl vào file `crawled_links.md`
+- Proxy pool xoay IP free/custom (bật trong menu) để crawl số lượng lớn
+- Lựa chọn backend Groq API cho Whisper (cần `GROQ_API_KEY`)
+- Bước lọc nhiễu/chuẩn hóa transcript (`clean_transcript.py`), sinh `.clean.json`
 
 ## Yêu cầu
 
@@ -48,6 +51,32 @@ Sau đó hiển thị danh sách video tiếng Việt tìm được và xác nh�
 
 Tải 2 video dưới dạng MP3? (y/n):
 ```
+
+## Cấu hình
+
+### GROQ_API_KEY
+
+Để sử dụng backend Groq cho Whisper, đặt biến môi trường `GROQ_API_KEY` hoặc thêm vào file `.env`:
+
+```bash
+# Cách 1: Biến môi trường
+export GROQ_API_KEY=your_api_key_here
+
+# Cách 2: File .env (tạo file .env ở thư mục gốc)
+GROQ_API_KEY=your_api_key_here
+```
+
+### Proxy tùy chọn
+
+Để nạp proxy riêng, tạo file `proxies.txt` ở thư mục gốc với danh sách proxy (một proxy mỗi dòng):
+
+```
+http://proxy1:port
+http://proxy2:port
+https://proxy3:port
+```
+
+Proxy pool sẽ tự động xoay IP khi crawl số lượng lớn hoặc khi gặp lỗi 429.
 
 ## Kết quả
 
