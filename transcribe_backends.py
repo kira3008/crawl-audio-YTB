@@ -9,6 +9,16 @@ import logging
 from pathlib import Path
 
 
+_METRIC_KEYS = ("no_speech_prob", "avg_logprob", "compression_ratio")
+
+
+def _attach_metrics(entry: dict, seg: dict) -> None:
+    for k in _METRIC_KEYS:
+        v = seg.get(k)
+        if v is not None:
+            entry[k] = float(v)
+
+
 def _sec_to_hms(sec: float) -> str:
     ms = round((sec % 1) * 1000)
     total = int(sec)
@@ -99,7 +109,7 @@ def transcribe_local(mp3_path: str, bundle: dict) -> list[dict]:
             start, end = words[0]["start"], words[-1]["end"]
         else:
             start, end = seg["start"], seg["end"]
-        entries.append({
+        entry = {
             "start": _sec_to_hms(start),
             "end": _sec_to_hms(end),
             "text": text,
@@ -107,7 +117,9 @@ def transcribe_local(mp3_path: str, bundle: dict) -> list[dict]:
                 {"word": w["word"], "start": _sec_to_hms(w["start"]), "end": _sec_to_hms(w["end"])}
                 for w in words
             ],
-        })
+        }
+        _attach_metrics(entry, seg)
+        entries.append(entry)
     return entries
 
 
@@ -258,10 +270,12 @@ def groq_response_to_entries(resp: dict, offset_sec: float = 0.0) -> list[dict]:
                     "start": _sec_to_hms(float(w["start"]) + offset_sec),
                     "end": _sec_to_hms(float(w["end"]) + offset_sec),
                 })
-        entries.append({
+        entry = {
             "start": _sec_to_hms(float(seg["start"]) + offset_sec),
             "end": _sec_to_hms(float(seg["end"]) + offset_sec),
             "text": text,
             "words": words_out,
-        })
+        }
+        _attach_metrics(entry, seg)
+        entries.append(entry)
     return entries

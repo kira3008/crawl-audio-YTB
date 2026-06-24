@@ -1,5 +1,5 @@
 import transcribe_backends as tb
-from transcribe_backends import _sec_to_hms, groq_response_to_entries, plan_chunks, merge_chunk_entries
+from transcribe_backends import _sec_to_hms, groq_response_to_entries, plan_chunks, merge_chunk_entries, _attach_metrics
 
 
 def test_sec_to_hms_basic():
@@ -101,3 +101,28 @@ def test_transcribe_groq_two_chunks(monkeypatch, tmp_path):
     assert texts == ["chunk0", "chunk1", "chunk2"]
     # offset ap dung: chunk1 bat dau ~595s
     assert out[1]["start"].startswith("00:09:5")
+
+
+def test_attach_metrics_copies_present():
+    entry = {}
+    _attach_metrics(entry, {"no_speech_prob": 0.7, "avg_logprob": -0.5,
+                            "compression_ratio": 1.8, "other": 1})
+    assert entry == {"no_speech_prob": 0.7, "avg_logprob": -0.5, "compression_ratio": 1.8}
+
+
+def test_attach_metrics_skips_missing_and_none():
+    entry = {}
+    _attach_metrics(entry, {"no_speech_prob": None})
+    assert entry == {}
+
+
+def test_groq_map_carries_metrics():
+    resp = {"segments": [
+        {"start": 0.0, "end": 1.0, "text": "A",
+         "no_speech_prob": 0.9, "avg_logprob": -1.2, "compression_ratio": 3.0},
+        {"start": 1.0, "end": 2.0, "text": "B"},   # khong co metric
+    ]}
+    out = groq_response_to_entries(resp)
+    assert out[0]["no_speech_prob"] == 0.9
+    assert out[0]["compression_ratio"] == 3.0
+    assert "no_speech_prob" not in out[1]
