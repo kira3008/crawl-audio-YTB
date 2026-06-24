@@ -3,6 +3,8 @@
 import re
 import json
 from pathlib import Path
+import difflib
+from collections import Counter
 
 TYPE_DIALOGUE = "dialogue"
 TYPE_MUSIC = "music"
@@ -16,6 +18,10 @@ LOGPROB_NOSPEECH_COMBO = 0.4
 
 REPEAT_MIN_TOKENS = 4
 REPEAT_UNIQUE_RATIO = 0.5
+
+SIM_THRESHOLD = 0.80
+GLOBAL_FREQ_MIN = 4
+GLOBAL_PHRASE_MAX_WORDS = 12
 
 _BRACKET_ONLY_RE = re.compile(r"^\s*\[[^\]]*\]\s*$")
 
@@ -63,6 +69,19 @@ def is_repetitive_text(text: str) -> bool:
 
 def _norm_key(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _is_near_dup(a: str, b: str) -> bool:
+    return difflib.SequenceMatcher(None, a, b).ratio() >= SIM_THRESHOLD
+
+
+def find_global_music_keys(entries: list[dict]) -> set[str]:
+    counts: Counter = Counter()
+    for e in entries:
+        key = _norm_key(e.get("text_raw", e.get("text", "")))
+        if key and 1 <= len(key.split()) <= GLOBAL_PHRASE_MAX_WORDS:
+            counts[key] += 1
+    return {k for k, c in counts.items() if c >= GLOBAL_FREQ_MIN}
 
 
 def tag_entries_heuristic(entries: list[dict], repeat_threshold: int = 3) -> list[dict]:

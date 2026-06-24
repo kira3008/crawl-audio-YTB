@@ -130,3 +130,32 @@ def test_repetitive_false_normal_sentence():
 
 def test_repetitive_false_too_short():
     assert is_repetitive_text("la la la") is False   # 3 token < nguong
+
+
+def test_near_dup_true():
+    from clean_transcript import _is_near_dup
+    assert _is_near_dup("la la la", "la la la la") is True
+
+
+def test_near_dup_false():
+    from clean_transcript import _is_near_dup
+    assert _is_near_dup("xin chao cac ban", "tam biet hen gap lai") is False
+
+
+def _e_full(text):
+    return {"start": "00:00:00.000", "end": "00:00:01.000", "text": text,
+            "text_raw": text, "words": []}
+
+
+def test_global_music_keys_threshold():
+    from clean_transcript import find_global_music_keys
+    entries = [_e_full("nhớ đăng ký kênh")] * 4 + [_e_full("Nội dung hôm nay rất hay")]
+    keys = find_global_music_keys(entries)
+    assert "nhớ đăng ký kênh" in keys
+    assert "nội dung hôm nay rất hay" not in keys
+
+
+def test_global_music_keys_below_threshold():
+    from clean_transcript import find_global_music_keys
+    entries = [_e_full("điệp khúc lặp")] * 3      # 3 < GLOBAL_FREQ_MIN
+    assert find_global_music_keys(entries) == set()
