@@ -93,19 +93,30 @@ def tag_entries_heuristic(entries: list[dict], repeat_threshold: int = 3) -> lis
         new["text"] = raw
         if is_sound_tag(raw):
             new["type"] = TYPE_SOUND
+        elif confidence_is_noise(new):
+            new["type"] = TYPE_NOISE
         elif is_hallucination(raw):
             new["type"] = TYPE_NOISE
+        elif is_repetitive_text(raw):
+            new["type"] = TYPE_MUSIC
         else:
             new["type"] = TYPE_DIALOGUE
         out.append(new)
 
-    # cau lap lien tiep >= threshold -> music
+    # tan suat toan bai -> music (chi dialogue)
+    music_keys = find_global_music_keys(out)
+    if music_keys:
+        for o in out:
+            if o["type"] == TYPE_DIALOGUE and _norm_key(o["text_raw"]) in music_keys:
+                o["type"] = TYPE_MUSIC
+
+    # near-duplicate lien tiep >= threshold -> music (chi dialogue)
     i = 0
     n = len(out)
     while i < n:
         j = i
-        key = _norm_key(out[i]["text_raw"])
-        while j + 1 < n and _norm_key(out[j + 1]["text_raw"]) == key and key:
+        ki = _norm_key(out[i]["text_raw"])
+        while j + 1 < n and ki and _is_near_dup(ki, _norm_key(out[j + 1]["text_raw"])):
             j += 1
         if (j - i + 1) >= repeat_threshold:
             for k in range(i, j + 1):

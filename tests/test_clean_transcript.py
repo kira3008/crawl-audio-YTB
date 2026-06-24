@@ -159,3 +159,46 @@ def test_global_music_keys_below_threshold():
     from clean_transcript import find_global_music_keys
     entries = [_e_full("điệp khúc lặp")] * 3      # 3 < GLOBAL_FREQ_MIN
     assert find_global_music_keys(entries) == set()
+
+
+# --- Task 5: new tests ---
+
+def _em(text, **kw):
+    e = {"start": "00:00:00.000", "end": "00:00:01.000", "text": text, "words": []}
+    e.update(kw)
+    return e
+
+
+def test_tag_confidence_demotes_to_noise():
+    out = tag_entries_heuristic([_em("nghe khong ro", no_speech_prob=0.8)])
+    assert out[0]["type"] == TYPE_NOISE
+
+
+def test_tag_sound_beats_confidence():
+    out = tag_entries_heuristic([_em("[Âm nhạc]", no_speech_prob=0.9)])
+    assert out[0]["type"] == TYPE_SOUND
+
+
+def test_tag_intra_repeat_music():
+    out = tag_entries_heuristic([_em("la la la la")])
+    assert out[0]["type"] == TYPE_MUSIC
+
+
+def test_tag_global_frequency_music():
+    entries = [_em("theo dõi để không bỏ lỡ")] * 4 + [_em("Nội dung chính ở đây")]
+    out = tag_entries_heuristic(entries)
+    assert all(o["type"] == TYPE_MUSIC for o in out[:4])
+    assert out[4]["type"] == TYPE_DIALOGUE
+
+
+def test_tag_near_dup_run_music():
+    entries = [_em("điệp khúc anh yêu em"),
+               _em("điệp khúc anh yêu em rồi"),
+               _em("điệp khúc anh yêu em đó")]
+    out = tag_entries_heuristic(entries)
+    assert all(o["type"] == TYPE_MUSIC for o in out)
+
+
+def test_tag_conservative_no_metrics_dialogue():
+    out = tag_entries_heuristic([_em("Hôm nay trời đẹp và mát mẻ")])
+    assert out[0]["type"] == TYPE_DIALOGUE
