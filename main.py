@@ -601,6 +601,16 @@ def main():
         device = wmodel["device"]
     console.print(f"[dim]Backend: {backend} [{device}][/dim]\n")
 
+    clean_client = None
+    try:
+        if backend == "groq":
+            clean_client = wmodel        # tái dùng client groq đã có
+        elif has_groq_key:
+            from transcribe_backends import load_groq_client
+            clean_client = load_groq_client()
+    except Exception:
+        clean_client = None
+
     # ── parallel download + pipeline transcription ────────────────────────────
     ffmpeg_dir = get_ffmpeg_dir()
     success, failed = [], []
@@ -636,6 +646,12 @@ def main():
                 safe = sanitize_filename(vid["title"])
                 progress.update(tid, status="[blue]🎙 Transcribing…[/blue]")
                 has_script = transcribe_audio(safe, output_dir, wmodel, backend)
+                if has_script:
+                    try:
+                        from clean_transcript import clean_file
+                        clean_file(Path(output_dir) / f"{safe}.json", client=clean_client)
+                    except Exception:
+                        pass
                 _append_link(vid, output_dir)
                 label = "[green]✓ +script[/green]" if has_script else "[green]✓ Xong[/green]"
                 progress.update(tid, status=label)
