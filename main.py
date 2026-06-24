@@ -184,13 +184,15 @@ def format_duration(seconds) -> str:
 
 # ── search ────────────────────────────────────────────────────────────────────
 
-def search_videos(keyword: str, fetch_count: int) -> list[dict]:
+def search_videos(keyword: str, fetch_count: int, proxy: str | None = None) -> list[dict]:
     """Fetch up to fetch_count results from YouTube search."""
     cmd = YTDLP_CMD + [
         "--dump-json", "--no-download", "--no-playlist", "--flat-playlist",
         "--extractor-args", "youtube:lang=vi",
-        f"ytsearch{fetch_count}:{keyword}",
     ]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    cmd += [f"ytsearch{fetch_count}:{keyword}"]
     result = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
@@ -345,12 +347,13 @@ def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "wh
 
 # ── download (single video) ───────────────────────────────────────────────────
 
-def download_one(
+def _download_attempt(
     video: dict,
     output_dir: str,
     ffmpeg_dir: str | None,
     progress,        # rich.progress.Progress (shared, thread-safe)
     task_id: int,
+    proxy: str | None = None,
 ) -> bool:
     import yt_dlp
 
@@ -410,6 +413,8 @@ def download_one(
     }
     if ffmpeg_dir:
         ydl_opts["ffmpeg_location"] = ffmpeg_dir
+    if proxy:
+        ydl_opts["proxy"] = proxy
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -419,6 +424,30 @@ def download_one(
         return True
     except Exception:
         return False
+
+
+def download_with_rotation(
+    video: dict,
+    output_dir: str,
+    ffmpeg_dir: str | None,
+    progress,
+    task_id: int,
+    pool=None,
+    max_retries: int = 3,
+) -> bool:
+    if pool is None:
+        return _download_attempt(video, output_dir, ffmpeg_dir, progress, task_id, None)
+
+    for _ in range(max_retries):
+        proxy = pool.get_proxy()
+        ok = _download_attempt(video, output_dir, ffmpeg_dir, progress, task_id, proxy)
+        if ok:
+            return True
+        if proxy:
+            pool.mark_bad(proxy)
+        else:
+            break          # khong con proxy -> dung
+    return False
 
 
 # ── duplicate check ──────────────────────────────────────────────────────────
@@ -518,6 +547,24 @@ def main():
     if workers_choice is None:
         return
     max_workers = int(workers_choice[0])
+
+    use_proxy = questionary.confirm(
+        "Bật proxy pool (xoay IP free để crawl số lượng lớn)?",
+        default=False,
+    ).ask()
+    if use_proxy is None:
+        return
+
+    pool = None
+    if use_proxy:
+        from proxy_pool import ProxyPool
+        pool = ProxyPool()
+        n_cache = pool.load_cache()
+        console.print(f"[dim]Proxy cache: {n_cache} proxy[/dim]")
+        with console.status("[bold green]Đang lấy & kiểm tra proxy free…[/bold green]"):
+            n = pool.refresh()
+        console.print(f"[green]✓ {n} proxy sống[/green]")
+        pool.start_background(interval_sec=600)
 
     whisper_choice = questionary.select(
         "Whisper model — tiếng Việt (dùng khi không có caption VTT):",
@@ -675,8 +722,8 @@ def main():
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(
-                    download_one, v, output_dir, ffmpeg_dir,
-                    progress, task_map[v["id"]],
+                    download_with_rotation, v, output_dir, ffmpeg_dir,
+                    progress, task_map[v["id"]], pool,
                 ): v
                 for v in to_download
             }
@@ -706,6 +753,9 @@ def main():
         1 for v in success
         if (out / f"{sanitize_filename(v['title'])}.json").exists()
     )
+
+    if pool is not None:
+        pool.stop_background()
 
     # ── summary panel ─────────────────────────────────────────────────────────
     lines = [f"[green]✓ {len(success)} file MP3 đã tải[/green]"]
