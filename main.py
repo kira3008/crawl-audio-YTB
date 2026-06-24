@@ -214,7 +214,9 @@ def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "lo
     try:
         if backend == "groq":
             from transcribe_backends import transcribe_groq
-            entries = transcribe_groq(str(mp3_path), model, get_ffmpeg_dir())
+            model_name = globals().get("_GROQ_MODEL", "whisper-large-v3-turbo")
+            entries = transcribe_groq(str(mp3_path), model, get_ffmpeg_dir(),
+                                      model=model_name)
         else:
             entries = transcribe_local(str(mp3_path), model)
         if not entries:
@@ -450,21 +452,53 @@ def main():
         console.print(f"[green]✓ {n} proxy sống[/green]")
         pool.start_background(interval_sec=600)
 
-    whisper_choice = questionary.select(
-        "Whisper model — tiếng Việt (dùng khi không có caption VTT):",
-        choices=[
-            "tiny        — nhanh nhất, ít chính xác (~39MB)",
-            "base        — cân bằng tốt (~74MB)",
-            "small       — chính xác hơn (~244MB)",
-            "medium      — rất tốt (~769MB) [mặc định]",
-            "large-v2    — tốt, ổn định (~1.5GB)",
-            "large-v3    — tốt nhất cho tiếng Việt (~1.5GB)",
-        ],
-        default="medium      — rất tốt (~769MB) [mặc định]",
+    import os
+    has_groq_key = bool(os.environ.get("GROQ_API_KEY"))
+    if not has_groq_key:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            has_groq_key = bool(os.environ.get("GROQ_API_KEY"))
+        except Exception:
+            pass
+
+    backend_choices = ["WhisperX local (mặc định)"]
+    if has_groq_key:
+        backend_choices.append("Groq API (nhanh)")
+    backend_choice = questionary.select(
+        "Backend nhận dạng giọng nói:", choices=backend_choices,
+        default="WhisperX local (mặc định)",
     ).ask()
-    if whisper_choice is None:
+    if backend_choice is None:
         return
-    whisper_model = whisper_choice.split()[0]
+    backend = "groq" if backend_choice.startswith("Groq") else "local"
+
+    if backend == "groq":
+        groq_model_choice = questionary.select(
+            "Groq Whisper model:",
+            choices=["whisper-large-v3-turbo  — nhanh nhất",
+                     "whisper-large-v3        — chính xác nhất"],
+            default="whisper-large-v3-turbo  — nhanh nhất",
+        ).ask()
+        if groq_model_choice is None:
+            return
+        whisper_model = groq_model_choice.split()[0]
+    else:
+        whisper_choice = questionary.select(
+            "Whisper model — tiếng Việt (dùng khi không có caption VTT):",
+            choices=[
+                "tiny        — nhanh nhất, ít chính xác (~39MB)",
+                "base        — cân bằng tốt (~74MB)",
+                "small       — chính xác hơn (~244MB)",
+                "medium      — rất tốt (~769MB) [mặc định]",
+                "large-v2    — tốt, ổn định (~1.5GB)",
+                "large-v3    — tốt nhất cho tiếng Việt (~1.5GB)",
+            ],
+            default="medium      — rất tốt (~769MB) [mặc định]",
+        ).ask()
+        if whisper_choice is None:
+            return
+        whisper_model = whisper_choice.split()[0]
 
     output_dir = questionary.text("Thư mục lưu file:", default="downloads").ask()
     if output_dir is None:
@@ -556,11 +590,16 @@ def main():
     )
 
     # ── load model trước download để pipeline kịp thời ───────────────────────
-    console.print(f"\n[bold]🎙 Load Whisper model [cyan]{whisper_model}[/cyan]…[/bold]")
-    wmodel = load_local_model(whisper_model)
-    device = wmodel["device"]
-    backend = "local"
-    console.print(f"[dim]Backend: WhisperX [{device.upper()}] + alignment vi[/dim]\n")
+    globals()["_GROQ_MODEL"] = whisper_model
+    console.print(f"\n[bold]🎙 Backend [cyan]{backend}[/cyan] · model [cyan]{whisper_model}[/cyan]…[/bold]")
+    if backend == "groq":
+        from transcribe_backends import load_groq_client
+        wmodel = load_groq_client()
+        device = "groq"
+    else:
+        wmodel = load_local_model(whisper_model)
+        device = wmodel["device"]
+    console.print(f"[dim]Backend: {backend} [{device}][/dim]\n")
 
     # ── parallel download + pipeline transcription ────────────────────────────
     ffmpeg_dir = get_ffmpeg_dir()
