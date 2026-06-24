@@ -1,7 +1,10 @@
 """proxy_pool.py — fetch, validate, xoay proxy free/custom cho yt-dlp."""
 
+import json
 import re
 import threading
+from pathlib import Path
+
 import requests
 
 _IPPORT_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}:\d{2,5}$")
@@ -77,11 +80,41 @@ class ProxyPool:
                 self._alive.remove(proxy)
                 self._idx = 0
 
+    def save_cache(self) -> None:
+        if not self.cache_file:
+            return
+        try:
+            with self._lock:
+                data = list(self._alive)
+            Path(self.cache_file).write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_cache(self) -> int:
+        if not self.cache_file:
+            return 0
+        try:
+            cf = Path(self.cache_file)
+            if not cf.exists():
+                return 0
+            data = json.loads(cf.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self.set_alive([str(x) for x in data])
+        except Exception:
+            return 0
+        return self.alive_count()
+
+    def refresh(self) -> int:
+        alive = self._validate(self._fetch_raw())
+        self.set_alive(alive)
+        self.save_cache()
+        return len(alive)
+
     def _fetch_raw(self) -> list[str]:
         lines: list[str] = []
         if self.custom_file:
             try:
-                from pathlib import Path
                 cf = Path(self.custom_file)
                 if cf.exists():
                     lines.extend(cf.read_text(encoding="utf-8", errors="replace").splitlines())

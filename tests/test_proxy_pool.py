@@ -1,3 +1,5 @@
+import json
+
 import proxy_pool as pp
 from proxy_pool import normalize_proxy, parse_proxy_lines, ProxyPool
 
@@ -84,3 +86,26 @@ def test_validate_keeps_only_200(monkeypatch):
     p = pp.ProxyPool(sources=[], custom_file=None, cache_file=None)
     alive = p._validate(["http://good:1", "http://bad:2", "http://err:3"])
     assert alive == ["http://good:1"]
+
+
+def test_cache_save_load_roundtrip(tmp_path):
+    cache = tmp_path / "cache.json"
+    p = pp.ProxyPool(sources=[], custom_file=None, cache_file=str(cache))
+    p.set_alive(["http://a:1", "http://b:2"])
+    p.save_cache()
+    assert json.loads(cache.read_text(encoding="utf-8")) == ["http://a:1", "http://b:2"]
+
+    p2 = pp.ProxyPool(sources=[], custom_file=None, cache_file=str(cache))
+    assert p2.load_cache() == 2
+    assert p2.alive_count() == 2
+
+
+def test_refresh_validates_and_caches(tmp_path, monkeypatch):
+    cache = tmp_path / "cache.json"
+    p = pp.ProxyPool(sources=[], custom_file=None, cache_file=str(cache))
+    monkeypatch.setattr(p, "_fetch_raw", lambda: ["http://a:1", "http://b:2"])
+    monkeypatch.setattr(p, "_validate", lambda proxies: ["http://a:1"])
+    n = p.refresh()
+    assert n == 1
+    assert p.alive_count() == 1
+    assert json.loads(cache.read_text(encoding="utf-8")) == ["http://a:1"]
