@@ -1,4 +1,5 @@
 import json
+import inspect
 from clean_transcript import (
     is_sound_tag, is_hallucination, tag_entries_heuristic,
     build_llm_prompt, apply_llm_result, llm_clean_batch,
@@ -202,3 +203,19 @@ def test_tag_near_dup_run_music():
 def test_tag_conservative_no_metrics_dialogue():
     out = tag_entries_heuristic([_em("Hôm nay trời đẹp và mát mẻ")])
     assert out[0]["type"] == TYPE_DIALOGUE
+
+
+def test_prompt_has_heuristic_label_and_examples():
+    batch = [{"text": "Xin chào", "text_raw": "Xin chào", "type": "dialogue"},
+             {"text": "la la la", "text_raw": "la la la", "type": "music"}]
+    p = build_llm_prompt(batch)
+    assert "[dialogue]" in p and "[music]" in p      # nhan heuristic theo dong
+    assert "dialogue" in p.lower()
+    assert "giữ" in p.lower() or "khong chac" in p.lower() or "không chắc" in p.lower()
+    # con giu index + text goc
+    assert "0" in p and "Xin chào" in p
+
+
+def test_llm_clean_batch_default_model_is_70b():
+    sig = inspect.signature(llm_clean_batch)
+    assert sig.parameters["model"].default == "llama-3.3-70b-versatile"

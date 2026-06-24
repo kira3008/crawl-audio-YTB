@@ -127,13 +127,21 @@ def tag_entries_heuristic(entries: list[dict], repeat_threshold: int = 3) -> lis
 
 
 def build_llm_prompt(batch: list[dict]) -> str:
-    lines = [f"{i}: {e.get('text_raw', e.get('text',''))}" for i, e in enumerate(batch)]
+    lines = [
+        f"{i} [{e.get('type', 'dialogue')}]: {e.get('text_raw', e.get('text', ''))}"
+        for i, e in enumerate(batch)
+    ]
     return (
-        "Bạn là bộ lọc transcript tiếng Việt. Với mỗi dòng dưới đây, "
-        "phân loại 'type' là một trong: dialogue (lời thoại/nội dung nói), "
-        "music (lời bài hát/giai điệu), noise (câu thừa, hallucination, "
-        "lời chào câu view không thuộc nội dung). Đồng thời chuẩn hóa 'text': "
-        "sửa dấu câu, viết hoa đầu câu, bỏ từ đệm lặp. "
+        "Bạn là bộ lọc transcript tiếng Việt. Phân loại mỗi dòng thành một "
+        "trong: dialogue (lời thoại/nội dung nói), music (lời bài hát/giai điệu), "
+        "noise (câu thừa, hallucination, lời chào câu view không thuộc nội dung).\n"
+        "QUAN TRỌNG: nếu KHÔNG chắc chắn, GIỮ là dialogue (thận trọng, tránh cắt nhầm lời thoại).\n"
+        "Nhãn trong [ ] là phỏng đoán sơ bộ của hệ thống — hãy xác nhận hoặc sửa lại.\n"
+        "Ví dụ:\n"
+        "  'Hôm nay chúng ta bàn về hạnh phúc.' -> dialogue\n"
+        "  'La la la la la' -> music\n"
+        "  'Nhớ like và đăng ký kênh nhé các bạn.' -> noise\n"
+        "Đồng thời chuẩn hóa 'text': sửa dấu câu, viết hoa đầu câu, bỏ từ đệm lặp.\n"
         "Trả về JSON: {\"items\": [{\"index\": int, \"type\": str, \"text\": str}, ...]}.\n\n"
         + "\n".join(lines)
     )
@@ -155,7 +163,7 @@ def apply_llm_result(batch: list[dict], result: list[dict]) -> list[dict]:
 
 
 def llm_clean_batch(client, batch: list[dict],
-                    model: str = "llama-3.1-8b-instant") -> list[dict]:
+                    model: str = "llama-3.3-70b-versatile") -> list[dict]:
     try:
         resp = client.chat.completions.create(
             model=model,
