@@ -143,8 +143,9 @@ def format_duration(seconds) -> str:
 
 # ── search ────────────────────────────────────────────────────────────────────
 
-def search_videos(keyword: str, fetch_count: int, proxy: str | None = None) -> list[dict]:
-    """Fetch up to fetch_count results from YouTube search."""
+def search_videos(keyword: str, fetch_count: int, proxy: str | None = None,
+                  seen_ids: set[str] | None = None) -> list[dict]:
+    """Fetch up to fetch_count results from YouTube search, dedup by video ID."""
     cmd = YTDLP_CMD + [
         "--dump-json", "--no-download", "--no-playlist", "--flat-playlist",
         "--extractor-args", "youtube:lang=vi",
@@ -155,6 +156,7 @@ def search_videos(keyword: str, fetch_count: int, proxy: str | None = None) -> l
     result = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
+    local_seen = seen_ids if seen_ids is not None else set()
     videos = []
     for line in result.stdout.strip().splitlines():
         if not line.strip():
@@ -162,8 +164,9 @@ def search_videos(keyword: str, fetch_count: int, proxy: str | None = None) -> l
         try:
             info = json.loads(line)
             vid_id = info.get("id") or info.get("url") or ""
-            if not vid_id:
+            if not vid_id or vid_id in local_seen:
                 continue
+            local_seen.add(vid_id)
             url = vid_id if vid_id.startswith("http") else f"https://www.youtube.com/watch?v={vid_id}"
             videos.append({
                 "id":       vid_id,
@@ -187,20 +190,23 @@ def search_until_enough(keyword: str, needed: int, status_fn=None,
     Returns (vi_videos[:needed], total_fetched).
     """
     fetch = max(int(needed * 1.5), 10)  # start 1.5× to reduce loop rounds
-    max_fetch = max(needed * 5, 100) # hard ceiling to avoid infinite loops
-    prev_total = -1
+    max_fetch = max(needed * 5, 100)    # hard ceiling to avoid infinite loops
+    seen_ids: set[str] = set()          # dedup across loop iterations
+    vi_videos: list[dict] = []
+    total_fetched = 0
 
     while True:
         if status_fn:
             status_fn(fetch)
-        all_videos = search_videos(keyword, fetch, proxy=proxy)
-        vi_videos  = [v for v in all_videos if v["is_vi"]]
+        # truyền seen_ids để mỗi vòng chỉ nhận video MỚI chưa thấy
+        new_videos = search_videos(keyword, fetch, proxy=proxy, seen_ids=seen_ids)
+        total_fetched += len(new_videos)
+        vi_videos.extend(v for v in new_videos if v["is_vi"])
 
-        # enough results or YouTube is exhausted (no new results came in)
-        if len(vi_videos) >= needed or len(all_videos) == prev_total or fetch >= max_fetch:
-            return vi_videos[:needed], len(all_videos)
+        # đủ kết quả, hoặc YouTube hết video mới trả về
+        if len(vi_videos) >= needed or not new_videos or fetch >= max_fetch:
+            return vi_videos[:needed], total_fetched
 
-        prev_total = len(all_videos)
         fetch = min(fetch + needed, max_fetch)
 
 
@@ -213,11 +219,15 @@ def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "lo
         logging.warning(f"[transcribe] MP3 not found: {mp3_path}")
         return False
     try:
+        model_name = globals().get("_WHISPER_MODEL", "whisper-large-v3")
         if backend == "groq":
             from transcribe_backends import transcribe_groq
-            model_name = globals().get("_GROQ_MODEL", "whisper-large-v3")
             entries = transcribe_groq(str(mp3_path), model, get_ffmpeg_dir(),
                                       model=model_name)
+        elif backend == "openrouter":
+            from transcribe_backends import transcribe_openrouter
+            entries = transcribe_openrouter(str(mp3_path), model, get_ffmpeg_dir(),
+                                            model=model_name)
         else:
             entries = transcribe_local(str(mp3_path), model)
         if not entries:
@@ -273,7 +283,7 @@ def _download_attempt(
 
     # >30 min → more fragment threads for faster downloads
     duration  = video.get("duration") or 0
-    fragments = 8 if duration > 1800 else 4
+    fragments = 16 if duration > 1800 else 8
 
     safe_title       = sanitize_filename(video["title"])
     output_template  = str(Path(output_dir) / f"{safe_title}.%(ext)s")
@@ -293,10 +303,10 @@ def _download_attempt(
         "noprogress":  True,
         "retries":          5,
         "fragment_retries": 5,
-        # tránh 429: chờ 2-5s giữa các request
-        "sleep_interval":         2,
-        "max_sleep_interval":     5,
-        "sleep_interval_requests": 1,
+        # sleep thấp hơn khi có proxy (xoay IP → ít bị 429)
+        "sleep_interval":          0 if proxy else 1,
+        "max_sleep_interval":      0 if proxy else 2,
+        "sleep_interval_requests": 0 if proxy else 1,
     }
     if ffmpeg_dir:
         ydl_opts["ffmpeg_location"] = ffmpeg_dir
@@ -390,6 +400,26 @@ def main():
     )
     from rich import box
     import questionary
+    from prompt_toolkit import prompt as pt_prompt
+    from prompt_toolkit.styles import Style as PtStyle
+
+    _pt_style = PtStyle.from_dict({"prompt": "bold cyan"})
+
+    def ask_text(prompt_str: str, default: str = "",
+                 validate_fn=None) -> str | None:
+        """Text input với paste support đầy đủ (Ctrl+V / chuột phải)."""
+        label = f"{prompt_str} "
+        while True:
+            try:
+                val = pt_prompt(label, default=default, style=_pt_style)
+            except (KeyboardInterrupt, EOFError):
+                return None
+            if validate_fn:
+                err = validate_fn(val)
+                if err is not True:
+                    print(f"  ⚠ {err}")
+                    continue
+            return val
 
     console = Console()
 
@@ -400,10 +430,10 @@ def main():
     ))
 
     # ── inputs ────────────────────────────────────────────────────────────────
-    keyword = questionary.text(
+    keyword = ask_text(
         "Từ khóa tìm kiếm:",
-        validate=lambda v: True if v.strip() else "Không được để trống",
-    ).ask()
+        validate_fn=lambda v: True if v.strip() else "Không được để trống",
+    )
     if keyword is None:
         return
 
@@ -416,10 +446,10 @@ def main():
         return
 
     if count_choice == "Tùy chỉnh":
-        raw = questionary.text(
+        raw = ask_text(
             "Nhập số lượng:",
-            validate=lambda v: True if v.isdigit() and int(v) > 0 else "Phải là số nguyên dương",
-        ).ask()
+            validate_fn=lambda v: True if v.isdigit() and int(v) > 0 else "Phải là số nguyên dương",
+        )
         if raw is None:
             return
         max_results = int(raw)
@@ -428,8 +458,8 @@ def main():
 
     workers_choice = questionary.select(
         "Số luồng tải song song:",
-        choices=["1 luồng", "2 luồng (mặc định)", "3 luồng", "4 luồng"],
-        default="2 luồng (mặc định)",
+        choices=["1 luồng", "2 luồng", "3 luồng", "4 luồng (mặc định)", "6 luồng", "8 luồng"],
+        default="4 luồng (mặc định)",
     ).ask()
     if workers_choice is None:
         return
@@ -454,25 +484,35 @@ def main():
         pool.start_background(interval_sec=600)
 
     import os
-    has_groq_key = bool(os.environ.get("GROQ_API_KEY"))
-    if not has_groq_key:
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-            has_groq_key = bool(os.environ.get("GROQ_API_KEY"))
-        except Exception:
-            pass
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    has_groq_key        = bool(os.environ.get("GROQ_API_KEY"))
+    openrouter_keys_raw = os.environ.get("OPENROUTER_API_KEYS", "")
+    openrouter_keys     = [k.strip() for k in openrouter_keys_raw.split(",") if k.strip()]
 
     backend_choices = ["WhisperX local (mặc định)"]
     if has_groq_key:
-        backend_choices.append("Groq API (nhanh)")
+        backend_choices.append("Groq API (nhanh, 20rpm · 7200s/h)")
+    if openrouter_keys:
+        backend_choices.append(
+            f"OpenRouter Whisper ({len(openrouter_keys)} key · 20rpm/key)"
+        )
     backend_choice = questionary.select(
         "Backend nhận dạng giọng nói:", choices=backend_choices,
         default="WhisperX local (mặc định)",
     ).ask()
     if backend_choice is None:
         return
-    backend = "groq" if backend_choice.startswith("Groq") else "local"
+
+    if backend_choice.startswith("Groq"):
+        backend = "groq"
+    elif backend_choice.startswith("OpenRouter"):
+        backend = "openrouter"
+    else:
+        backend = "local"
 
     if backend == "groq":
         groq_model_choice = questionary.select(
@@ -484,9 +524,19 @@ def main():
         if groq_model_choice is None:
             return
         whisper_model = groq_model_choice.split()[0]
+    elif backend == "openrouter":
+        or_model_choice = questionary.select(
+            "OpenRouter Whisper model:",
+            choices=["openai/whisper-large-v3        — chính xác nhất [mặc định]",
+                     "openai/whisper-large-v3-turbo  — nhanh hơn"],
+            default="openai/whisper-large-v3        — chính xác nhất [mặc định]",
+        ).ask()
+        if or_model_choice is None:
+            return
+        whisper_model = or_model_choice.split()[0]
     else:
         whisper_choice = questionary.select(
-            "Whisper model — tiếng Việt (dùng khi không có caption VTT):",
+            "Whisper model — tiếng Việt:",
             choices=[
                 "tiny        — nhanh nhất, ít chính xác (~39MB)",
                 "base        — cân bằng tốt (~74MB)",
@@ -501,7 +551,7 @@ def main():
             return
         whisper_model = whisper_choice.split()[0]
 
-    output_dir = questionary.text("Thư mục lưu file:", default="downloads").ask()
+    output_dir = ask_text("Thư mục lưu file:", default="downloads")
     if output_dir is None:
         return
 
@@ -526,6 +576,8 @@ def main():
             border_style="yellow",
         ))
         return
+
+    vi_videos.sort(key=lambda v: v.get("duration") or float("inf"))
 
     console.print(
         f"[green]Tìm thấy[/green] [bold]{len(vi_videos)}[/bold] video tiếng Việt "
@@ -586,6 +638,9 @@ def main():
         ))
         return
 
+    # ưu tiên video ngắn trước — file nhỏ hơn, giải phóng worker sớm hơn
+    to_download.sort(key=lambda v: v.get("duration") or float("inf"))
+
     console.print()
     console.print(
         f"[bold]Tải [cyan]{len(to_download)}[/cyan] video mới · "
@@ -593,21 +648,44 @@ def main():
     )
 
     # ── load model trước download để pipeline kịp thời ───────────────────────
-    globals()["_GROQ_MODEL"] = whisper_model
+    globals()["_WHISPER_MODEL"] = whisper_model
     console.print(f"\n[bold]🎙 Backend [cyan]{backend}[/cyan] · model [cyan]{whisper_model}[/cyan]…[/bold]")
     if backend == "groq":
         from transcribe_backends import load_groq_client
         wmodel = load_groq_client()
+        wmodels = None
         device = "groq"
+    elif backend == "openrouter":
+        from transcribe_backends import _OpenRouterKeyPool
+        wmodel = _OpenRouterKeyPool(openrouter_keys)
+        wmodels = None
+        device = f"openrouter ({wmodel.count()} key)"
     else:
-        wmodel = load_local_model(whisper_model)
-        device = wmodel["device"]
+        local_worker_choice = questionary.select(
+            "Số worker transcribe local (mỗi worker = 1 model riêng — RAM nếu CPU, VRAM nếu GPU):",
+            choices=[
+                "1 worker — CPU / GPU ít VRAM",
+                "2 worker — GPU ≥8GB",
+                "3 worker — GPU ≥16GB [khuyến nghị cho card 24GB]",
+                "4 worker — GPU ≥24GB, tận dụng tối đa",
+            ],
+            default="3 worker — GPU ≥16GB [khuyến nghị cho card 24GB]",
+        ).ask()
+        if local_worker_choice is None:
+            return
+        n_local_workers = int(local_worker_choice[0])
+        console.print(f"[dim]Đang load {n_local_workers} model(s)…[/dim]")
+        wmodels = [load_local_model(whisper_model) for _ in range(n_local_workers)]
+        wmodel  = wmodels[0]
+        device  = wmodels[0]["device"]
     console.print(f"[dim]Backend: {backend} [{device}][/dim]\n")
 
     clean_client = None
     try:
         if backend == "groq":
-            clean_client = wmodel        # tái dùng client groq đã có
+            clean_client = wmodel
+        elif backend == "openrouter":
+            clean_client = wmodel          # tái dùng key pool cho clean_transcript
         elif has_groq_key:
             from transcribe_backends import load_groq_client
             clean_client = load_groq_client()
@@ -640,7 +718,15 @@ def main():
             )
             task_map[v["id"]] = tid
 
-        def _transcribe_worker():
+        # API backends: song song theo max_workers; local: theo số model đã load
+        if backend in ("groq", "openrouter"):
+            n_transcribe_workers = max_workers
+        else:
+            n_transcribe_workers = len(wmodels)
+
+        def _transcribe_worker(worker_idx: int):
+            # mỗi local worker dùng model riêng; API backends dùng wmodel chung
+            my_model = wmodels[worker_idx] if wmodels else wmodel
             while True:
                 item = transcribe_q.get()
                 if item is None:
@@ -648,7 +734,7 @@ def main():
                 vid, tid = item
                 safe = sanitize_filename(vid["title"])
                 progress.update(tid, status="[blue]🎙 Transcribing…[/blue]")
-                has_script = transcribe_audio(safe, output_dir, wmodel, backend)
+                has_script = transcribe_audio(safe, output_dir, my_model, backend)
                 if has_script:
                     try:
                         from clean_transcript import clean_file
@@ -660,8 +746,12 @@ def main():
                 progress.update(tid, status=label)
                 transcribe_q.task_done()
 
-        t_worker = threading.Thread(target=_transcribe_worker, daemon=True)
-        t_worker.start()
+        t_workers = [
+            threading.Thread(target=_transcribe_worker, args=(i,), daemon=True)
+            for i in range(n_transcribe_workers)
+        ]
+        for w in t_workers:
+            w.start()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
@@ -687,9 +777,11 @@ def main():
                     progress.update(tid, status="[red]✗ Lỗi[/red]")
                     failed.append(video)
 
-        # Chờ transcription worker xử lý hết queue trước khi đóng progress
-        transcribe_q.put(None)
-        t_worker.join()
+        # Gửi sentinel cho mỗi worker rồi chờ hết
+        for _ in t_workers:
+            transcribe_q.put(None)
+        for w in t_workers:
+            w.join()
 
     # count JSON script files actually saved
     out = Path(output_dir)
@@ -704,7 +796,7 @@ def main():
     # ── summary panel ─────────────────────────────────────────────────────────
     lines = [f"[green]✓ {len(success)} file MP3 đã tải[/green]"]
     if script_count:
-        lines.append(f"[green]📝 {script_count} script JSON (WhisperX)[/green]")
+        lines.append(f"[green]📝 {script_count} script JSON (Whisper)[/green]")
     no_script = len(success) - script_count
     if no_script:
         lines.append(f"[dim]   {no_script} video không có captions tiếng Việt[/dim]")

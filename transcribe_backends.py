@@ -6,7 +6,78 @@ Tat ca tra ve schema chung:
 
 import subprocess
 import logging
+import threading
+import time
 from pathlib import Path
+
+
+class _GroqRateLimiter:
+    """Thread-safe rate limiter theo Groq Whisper limits:
+    20 req/min · 7200 audio-sec/hour · 28800 audio-sec/day.
+    """
+    RPM             = 20
+    AUDIO_PER_HOUR  = 7_200
+    AUDIO_PER_DAY   = 28_800
+
+    def __init__(self):
+        self._lock       = threading.Lock()
+        self._req_times: list[float] = []   # timestamps trong 60s gần nhất
+        self._hour_audio = 0.0
+        self._day_audio  = 0.0
+        self._hour_t     = time.monotonic()
+        self._day_t      = time.monotonic()
+
+    def acquire(self, duration_sec: float) -> bool:
+        """Block cho đến khi rate limit cho phép. Trả False nếu hết quota ngày."""
+        deadline = time.monotonic() + 4000   # chờ tối đa ~1h trước khi bỏ qua
+        while True:
+            with self._lock:
+                now = time.monotonic()
+
+                # reset counter giờ / ngày
+                if now - self._hour_t >= 3600:
+                    self._hour_audio = 0.0
+                    self._hour_t = now
+                if now - self._day_t >= 86400:
+                    self._day_audio = 0.0
+                    self._day_t = now
+
+                # sliding window 60s cho RPM
+                self._req_times = [t for t in self._req_times if now - t < 60]
+
+                rpm_ok  = len(self._req_times) < self.RPM
+                hour_ok = self._hour_audio + duration_sec <= self.AUDIO_PER_HOUR
+                day_ok  = self._day_audio  + duration_sec <= self.AUDIO_PER_DAY
+
+                if not day_ok:
+                    logging.warning("[groq] Hết quota ngày (28800s audio). Bỏ qua chunk.")
+                    return False
+
+                if rpm_ok and hour_ok:
+                    self._req_times.append(now)
+                    self._hour_audio += duration_sec
+                    self._day_audio  += duration_sec
+                    return True
+
+                # tính thời gian cần chờ và log để anh biết
+                wait_reason = []
+                if not rpm_ok:
+                    oldest = self._req_times[0] if self._req_times else now
+                    wait_reason.append(f"RPM ({len(self._req_times)}/20)")
+                if not hour_ok:
+                    wait_reason.append(
+                        f"giờ ({self._hour_audio:.0f}/{self.AUDIO_PER_HOUR}s)"
+                    )
+                logging.info(f"[groq] Rate limit — chờ... ({', '.join(wait_reason)})")
+
+            if time.monotonic() > deadline:
+                logging.warning("[groq] Chờ rate limit quá lâu. Bỏ qua chunk.")
+                return False
+
+            time.sleep(2.0)
+
+
+_groq_limiter = _GroqRateLimiter()
 
 
 _METRIC_KEYS = ("no_speech_prob", "avg_logprob", "compression_ratio")
@@ -49,14 +120,16 @@ def _detect_gpu() -> bool:
 
 def load_local_model(model_name: str) -> dict:
     import warnings
-    warnings.filterwarnings("ignore", message="torchcodec is not installed")
+    warnings.filterwarnings("ignore", message="torchcodec is not installed", category=UserWarning)
+    warnings.filterwarnings("ignore", module="pyannote")
     import whisperx
 
     device = "cpu"
     download_root = str(Path(__file__).parent / "models")
     if _detect_gpu():
         try:
-            asr_model = whisperx.load_model(model_name, device="cuda", compute_type="int8",
+            # float16: chính xác hơn int8, phù hợp khi GPU có đủ VRAM (≥6GB cho large-v3)
+            asr_model = whisperx.load_model(model_name, device="cuda", compute_type="float16",
                                             language="vi", download_root=download_root)
             device = "cuda"
         except Exception:
@@ -73,7 +146,7 @@ def load_local_model(model_name: str) -> dict:
 def transcribe_local(mp3_path: str, bundle: dict) -> list[dict]:
     import whisperx
     device = bundle["device"]
-    batch_size = 16 if device == "cuda" else 4
+    batch_size = 24 if device == "cuda" else 4
 
     audio = whisperx.load_audio(str(mp3_path))
 
@@ -171,6 +244,203 @@ def merge_chunk_entries(entry_lists: list[list[dict]]) -> list[dict]:
     return merged
 
 
+class _OpenRouterKeyPool:
+    """Xoay API key + per-key rate limiting cho OpenRouter Whisper.
+
+    Limits áp dụng PER KEY (= per account):
+      20 req/phút · 1000 req/ngày (account đã nạp ≥$10 credits).
+
+    Lưu ý: nhiều key cùng 1 account KHÔNG bypass limit — chỉ có tác dụng
+    khi key đến từ các account khác nhau.
+    """
+    RPM = 20
+    RPD = 1000
+
+    def __init__(self, keys: list[str]):
+        self._keys = list(keys)
+        self._lock = threading.Lock()
+        self._req_times: dict[str, list[float]] = {k: [] for k in keys}
+        self._day_reqs:  dict[str, int]         = {k: 0  for k in keys}
+        self._day_t:     dict[str, float]        = {k: time.monotonic() for k in keys}
+        # key bị block cứng đến thời điểm này (do 429 thực từ API)
+        self._blocked_until: dict[str, float]   = {k: 0.0 for k in keys}
+
+    def acquire(self) -> str | None:
+        """Trả API key sẵn sàng. Block nếu cần, trả None nếu hết quota ngày."""
+        deadline = time.monotonic() + 120
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                for key in self._keys:
+                    # bị block cứng (do 429 thực) → bỏ qua
+                    if now < self._blocked_until[key]:
+                        continue
+                    # reset counter ngày
+                    if now - self._day_t[key] >= 86400:
+                        self._day_reqs[key] = 0
+                        self._day_t[key] = now
+                    # sliding window RPM
+                    self._req_times[key] = [t for t in self._req_times[key] if now - t < 60]
+
+                    if len(self._req_times[key]) < self.RPM and self._day_reqs[key] < self.RPD:
+                        self._req_times[key].append(now)
+                        self._day_reqs[key] += 1
+                        return key
+
+                exhausted_today = all(self._day_reqs[k] >= self.RPD for k in self._keys)
+                if exhausted_today:
+                    logging.warning("[openrouter] Tất cả key hết quota ngày (1000 req).")
+                    return None
+
+            if time.monotonic() > deadline:
+                logging.warning("[openrouter] Chờ rate limit quá lâu. Bỏ qua.")
+                return None
+            time.sleep(2.0)
+
+    def mark_rate_limited(self, key: str, retry_after: float = 60.0) -> None:
+        """Gọi khi nhận 429 thực từ API — block key này trong retry_after giây."""
+        with self._lock:
+            self._blocked_until[key] = time.monotonic() + retry_after
+            short = key[-8:]
+            logging.warning(
+                f"[openrouter] Key ...{short} bị 429 → block {retry_after:.0f}s, xoay sang key khác"
+            )
+
+    def status(self) -> str:
+        """Tóm tắt trạng thái các key để hiển thị."""
+        with self._lock:
+            now = time.monotonic()
+            parts = []
+            for i, k in enumerate(self._keys, 1):
+                rpm  = len([t for t in self._req_times[k] if now - t < 60])
+                day  = self._day_reqs[k]
+                blocked = now < self._blocked_until[k]
+                state = "🔴blocked" if blocked else f"{rpm}rpm·{day}req"
+                parts.append(f"key{i}:[{state}]")
+            return "  ".join(parts)
+
+    def count(self) -> int:
+        return len(self._keys)
+
+
+def load_openrouter_pool() -> "_OpenRouterKeyPool":
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    import os
+    raw = os.environ.get("OPENROUTER_API_KEYS", "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys:
+        raise RuntimeError("Thiếu OPENROUTER_API_KEYS trong .env (phân cách bằng dấu phẩy)")
+    return _OpenRouterKeyPool(keys)
+
+
+_OR_ENDPOINT = "https://openrouter.ai/api/v1/audio/transcriptions"
+
+
+def _or_headers(key: str) -> dict:
+    return {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/crawl-video",
+        "X-OpenRouter-Title": "Vietnamese Audio Crawler",
+    }
+
+
+def transcribe_openrouter(mp3_path: str, key_pool: "_OpenRouterKeyPool",
+                          ffmpeg_exe: str | None,
+                          model: str = "openai/whisper-large-v3") -> list[dict]:
+    import requests as _req
+    import base64
+    import json as _json
+    import re as _re
+    import tempfile
+    import os
+
+    ffmpeg = ffmpeg_exe or "ffmpeg"
+    if ffmpeg and Path(ffmpeg).is_dir():
+        ffmpeg = str(Path(ffmpeg) / "ffmpeg.exe")
+
+    duration = _probe_duration(mp3_path, ffmpeg)
+    windows  = plan_chunks(duration) if duration > 0 else [(0.0, 0.0)]
+
+    entry_lists: list[list[dict]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (start, end) in enumerate(windows):
+            flac = os.path.join(tmp, f"chunk_{i}.flac")
+            try:
+                if end > start:
+                    _extract_chunk_flac(mp3_path, start, end, ffmpeg, flac)
+                else:
+                    subprocess.run(
+                        [ffmpeg, "-y", "-loglevel", "error",
+                         "-i", mp3_path, "-ar", "16000", "-ac", "1", "-c:a", "flac", flac],
+                        check=True, capture_output=True,
+                    )
+            except Exception as e:
+                logging.error(f"[openrouter] chunk {i} ffmpeg loi: {e}")
+                continue
+
+            with open(flac, "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode("utf-8")
+
+            payload = _json.dumps({
+                "model": model,
+                "input_audio": {"data": b64, "format": "flac"},
+            })
+
+            max_retries = key_pool.count() + 2
+            conn_failures = 0
+            for attempt in range(max_retries):
+                key = key_pool.acquire()
+                if key is None:
+                    break
+                try:
+                    resp = _req.post(
+                        _OR_ENDPOINT,
+                        headers=_or_headers(key),
+                        data=payload,
+                        timeout=120,
+                    )
+                    if resp.status_code == 429:
+                        m = _re.search(r"retry.after[=: ]+(\d+)", resp.text.lower())
+                        retry_after = float(m.group(1)) if m else 60.0
+                        key_pool.mark_rate_limited(key, retry_after)
+                        if attempt < max_retries - 1:
+                            continue
+                        logging.error(f"[openrouter] chunk {i} 429 — hết key")
+                        break
+                    resp.raise_for_status()
+                    text = (resp.json().get("text") or "").strip()
+                    if text:
+                        # OpenRouter chỉ trả text, không có timestamps
+                        entry_lists.append([{
+                            "start": _sec_to_hms(start),
+                            "end":   _sec_to_hms(end if end > start else duration),
+                            "text":  text,
+                            "words": [],
+                        }])
+                    break
+                except _req.exceptions.ConnectionError as e:
+                    conn_failures += 1
+                    wait = min(5 * conn_failures, 30)
+                    logging.warning(
+                        f"[openrouter] chunk {i} lỗi kết nối (lần {conn_failures})"
+                        f" — thử lại sau {wait}s"
+                    )
+                    time.sleep(wait)
+                    if attempt < max_retries - 1:
+                        continue
+                    break
+                except Exception as e:
+                    logging.error(f"[openrouter] chunk {i} attempt {attempt+1} loi: {e}")
+                    break
+
+    return merge_chunk_entries(entry_lists)
+
+
 def load_groq_client():
     try:
         from dotenv import load_dotenv
@@ -222,31 +492,47 @@ def transcribe_groq(mp3_path: str, client, ffmpeg_exe: str | None,
     entry_lists: list[list[dict]] = []
     with tempfile.TemporaryDirectory() as tmp:
         for i, (start, end) in enumerate(windows):
+            chunk_dur = (end - start) if end > start else duration
+            if not _groq_limiter.acquire(chunk_dur):
+                continue   # quota ngày hết, bỏ qua chunk này
+
             flac = os.path.join(tmp, f"chunk_{i}.flac")
             try:
                 if end > start:
                     _extract_chunk_flac(mp3_path, start, end, ffmpeg, flac)
-                    src = flac
                 else:
-                    # duration unknown: downsample whole file to stay under Groq size limit
                     subprocess.run(
                         [ffmpeg, "-y", "-loglevel", "error",
                          "-i", mp3_path,
                          "-ar", "16000", "-ac", "1", "-c:a", "flac", flac],
                         check=True, capture_output=True,
                     )
-                    src = flac
-                with open(src, "rb") as fh:
-                    resp = client.audio.transcriptions.create(
-                        model=model, file=(os.path.basename(src), fh.read()),
-                        language="vi", response_format="verbose_json",
-                        timestamp_granularities=["segment", "word"],
-                    )
-                data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
-                entry_lists.append(groq_response_to_entries(data, offset_sec=start))
             except Exception as e:
-                logging.error(f"[groq] chunk {i} loi: {e}")
+                logging.error(f"[groq] chunk {i} ffmpeg loi: {e}")
                 continue
+
+            for attempt in range(3):
+                try:
+                    with open(flac, "rb") as fh:
+                        resp = client.audio.transcriptions.create(
+                            model=model, file=(os.path.basename(flac), fh.read()),
+                            language="vi", response_format="verbose_json",
+                            timestamp_granularities=["segment", "word"],
+                        )
+                    data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+                    entry_lists.append(groq_response_to_entries(data, offset_sec=start))
+                    break
+                except Exception as e:
+                    err_str = str(e).lower()
+                    is_429 = "429" in err_str or "rate limit" in err_str
+                    if is_429:
+                        logging.info(f"[groq] chunk {i} 429 — chờ rate limiter rồi thử lại")
+                        # limiter sẽ tự block lần acquire tiếp theo
+                    else:
+                        logging.error(f"[groq] chunk {i} attempt {attempt+1} loi: {e}")
+                    if attempt == 2:
+                        break
+                    time.sleep(5 * (attempt + 1))
     return merge_chunk_entries(entry_lists)
 
 

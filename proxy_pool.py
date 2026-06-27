@@ -3,6 +3,7 @@
 import json
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -45,12 +46,14 @@ DEFAULT_SOURCES = [
 class ProxyPool:
     def __init__(self, sources=None, custom_file="proxies.txt",
                  cache_file="proxy_cache.json",
-                 validate_url="https://www.youtube.com", timeout=5.0):
+                 validate_url="https://www.youtube.com", timeout=5.0,
+                 max_alive=30):
         self.sources = DEFAULT_SOURCES if sources is None else list(sources)
         self.custom_file = custom_file
         self.cache_file = cache_file
         self.validate_url = validate_url
         self.timeout = timeout
+        self.max_alive = max_alive
         self._alive: list[str] = []
         self._idx = 0
         self._lock = threading.Lock()
@@ -121,26 +124,45 @@ class ProxyPool:
                     lines.extend(cf.read_text(encoding="utf-8", errors="replace").splitlines())
             except Exception:
                 pass
-        for src in self.sources:
+
+        def _get(src):
             try:
                 r = requests.get(src, timeout=self.timeout)
-                if r.status_code == 200:
-                    lines.extend(r.text.splitlines())
+                return r.text if r.status_code == 200 else ""
             except Exception:
-                continue
+                return ""
+
+        with ThreadPoolExecutor(max_workers=len(self.sources)) as ex:
+            for text in ex.map(_get, self.sources):
+                lines.extend(text.splitlines())
+
         return parse_proxy_lines("\n".join(lines))
 
     def _validate(self, proxies: list[str]) -> list[str]:
         alive: list[str] = []
-        for px in proxies:
+        stop = threading.Event()
+
+        def _check(px):
+            if stop.is_set():
+                return None
             try:
                 r = requests.get(self.validate_url,
                                  proxies={"http": px, "https": px},
                                  timeout=self.timeout)
-                if r.status_code == 200:
-                    alive.append(px)
+                return px if r.status_code == 200 else None
             except Exception:
-                continue
+                return None
+
+        with ThreadPoolExecutor(max_workers=50) as ex:
+            futures = {ex.submit(_check, px): px for px in proxies}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result:
+                    alive.append(result)
+                    if len(alive) >= self.max_alive:
+                        stop.set()
+                        break
+
         return alive
 
     def start_background(self, interval_sec: int = 600) -> None:
