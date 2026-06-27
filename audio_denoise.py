@@ -12,6 +12,7 @@ LOUDNORM_I       = -23
 LOUDNORM_TP      = -1.5
 LOUDNORM_LRA     = 11
 HIGHPASS_HZ      = 80
+DENOISE_SUBDIR   = "audio_denoised"
 
 
 def _cuda_available() -> bool:
@@ -41,7 +42,7 @@ def _ensure_demucs():
 def load_demucs(device=None):
     Separator = _ensure_demucs()
     dev = _pick_device(device, _cuda_available())
-    return Separator(model=DEMUCS_MODEL, device=dev)
+    return Separator(model=DEMUCS_MODEL, device=dev, overlap=DEMUCS_OVERLAP)
 
 
 def _post_filter() -> str:
@@ -87,9 +88,8 @@ def denoise_file(in_path, out_path, separator, ffmpeg_exe) -> bool:
             pass
 
 
-def denoise_batch(in_paths, out_dir, ffmpeg_exe, console=None):
+def denoise_batch(in_paths, ffmpeg_exe, console=None):
     from pathlib import Path
-    out_dir = Path(out_dir)
 
     def log(msg):
         if console:
@@ -103,10 +103,11 @@ def denoise_batch(in_paths, out_dir, ffmpeg_exe, console=None):
         log(f"[red]✗ Demucs khong kha dung ({e}) — bo qua denoise, KHONG cat tho.[/red]")
         return {}
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     result: dict = {}
     for p in in_paths:
         p = Path(p)
+        out_dir = p.parent / DENOISE_SUBDIR
+        out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{p.stem}.wav"
         if denoise_file(p, out_path, separator, ffmpeg_exe):
             result[p] = out_path

@@ -200,7 +200,7 @@ def split_one(
     src_path = source if source is not None else json_path.with_suffix(".mp3")
     seg_ext  = src_path.suffix          # ".wav" khi da denoise, ".mp3" khi khong
     if not src_path.exists():
-        log(f"[red]✗ Không tìm thấy MP3: {src_path.name}[/red]")
+        log(f"[red]✗ Không tìm thấy audio: {src_path.name}[/red]")
         return 0, 1
 
     entries: list[dict] = load_entries_for_split(json_path)
@@ -435,13 +435,15 @@ def main():
 
     from audio_denoise import denoise_batch
     mp3_inputs = [jf.with_suffix(".mp3") for jf in json_files]
-    denoise_dir = json_files[0].parent / "audio_denoised"
-    console.print("[bold]Đang lọc nhiễu (Demucs)…[/bold]")
-    denoise_map = denoise_batch(mp3_inputs, denoise_dir, ffmpeg_exe, console=console)
-    split_pairs = plan_split_sources(json_files, denoise_map)
-    if not split_pairs:
-        console.print("[red]Không có file nào denoise thành công — dừng.[/red]")
-        return
+    if args.inspect:
+        split_pairs = [(jf, None) for jf in json_files]
+    else:
+        console.print("[bold]Đang lọc nhiễu (Demucs)…[/bold]")
+        denoise_map = denoise_batch(mp3_inputs, ffmpeg_exe, console=console)
+        split_pairs = plan_split_sources(json_files, denoise_map)
+        if not split_pairs:
+            console.print("[red]Không có file nào denoise thành công — dừng.[/red]")
+            return
 
     total_ok = total_err = 0
 

@@ -21,9 +21,10 @@ def test_load_demucs_builds_separator(monkeypatch):
     created = {}
 
     class FakeSeparator:
-        def __init__(self, model=None, device=None):
+        def __init__(self, model=None, device=None, overlap=None):
             created["model"] = model
             created["device"] = device
+            created["overlap"] = overlap
 
     monkeypatch.setattr(audio_denoise, "_ensure_demucs", lambda: FakeSeparator)
     monkeypatch.setattr(audio_denoise, "_cuda_available", lambda: False)
@@ -31,6 +32,7 @@ def test_load_demucs_builds_separator(monkeypatch):
     assert isinstance(sep, FakeSeparator)
     assert created["model"] == "htdemucs"
     assert created["device"] == "cpu"
+    assert created["overlap"] == 0.25
 
 
 def test_load_demucs_raises_when_unavailable(monkeypatch):
@@ -142,10 +144,10 @@ def test_denoise_batch_loads_once_and_maps(monkeypatch, tmp_path):
     monkeypatch.setattr(audio_denoise, "denoise_file",
                         lambda i, o, s, f: True)
     ins = [tmp_path / "a.mp3", tmp_path / "b.mp3"]
-    out = audio_denoise.denoise_batch(ins, tmp_path / "den", "ffmpeg")
+    out = audio_denoise.denoise_batch(ins, "ffmpeg")
     assert calls["load"] == 1
     assert set(out.keys()) == set(ins)
-    assert out[ins[0]] == tmp_path / "den" / "a.wav"
+    assert out[ins[0]] == tmp_path / "audio_denoised" / "a.wav"
 
 
 def test_denoise_batch_abort_on_load_fail(monkeypatch, tmp_path):
@@ -158,7 +160,7 @@ def test_denoise_batch_abort_on_load_fail(monkeypatch, tmp_path):
     called = {"file": 0}
     monkeypatch.setattr(audio_denoise, "denoise_file",
                         lambda *a, **k: called.__setitem__("file", 1) or True)
-    out = audio_denoise.denoise_batch([tmp_path / "a.mp3"], tmp_path / "den", "ffmpeg")
+    out = audio_denoise.denoise_batch([tmp_path / "a.mp3"], "ffmpeg")
     assert out == {}
     assert called["file"] == 0      # khong cat tho file nao
 
@@ -172,6 +174,6 @@ def test_denoise_batch_skips_failed_file(monkeypatch, tmp_path):
 
     monkeypatch.setattr(audio_denoise, "denoise_file", half)
     ins = [tmp_path / "a.mp3", tmp_path / "b.mp3"]
-    out = audio_denoise.denoise_batch(ins, tmp_path / "den", "ffmpeg")
+    out = audio_denoise.denoise_batch(ins, "ffmpeg")
     assert (tmp_path / "a.mp3") in out
     assert (tmp_path / "b.mp3") not in out
