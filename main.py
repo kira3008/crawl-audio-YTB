@@ -57,12 +57,17 @@ _VI_KEYWORDS = frozenset({
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def get_ffmpeg_dir() -> str | None:
+    import shutil
+    # Ưu tiên ffmpeg hệ thống trên PATH (Linux/macOS thường có sẵn).
+    # Trả None → yt-dlp/ffmpeg tự tìm trên PATH.
+    if shutil.which("ffmpeg"):
+        return None
     script_dir = Path(__file__).parent
     local_ffmpeg = script_dir / "ffmpeg.exe"
     if local_ffmpeg.exists():
         return str(script_dir)
     try:
-        import imageio_ffmpeg, shutil
+        import imageio_ffmpeg
         shutil.copy2(imageio_ffmpeg.get_ffmpeg_exe(), local_ffmpeg)
         return str(script_dir)
     except Exception:
