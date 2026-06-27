@@ -93,15 +93,18 @@ denoise_batch(in_paths: list[Path], out_dir: Path, ffmpeg_exe: str,
 
 ## Component 2 — Đường Demucs (đường duy nhất)
 
-**Đường chính (chốt):** dùng API chính thức `demucs.api.Separator` (demucs 4.0.x) — tự decode
-file đầu vào (kể cả mp3, qua torchaudio/ffmpeg nội bộ), trả các stem theo **tên** →
-lấy `separated["vocals"]`. Đơn giản, không tự lo decode.
-
-**Dự phòng (chỉ khi API đổi/không cho lấy raw tensor stem):** low-level
-`get_model("htdemucs")` + `apply_model(..., split=True, overlap=0.25)`; khi đó **phải** decode
-mp3 trước (ffmpeg → wav, **không** giả định `torchaudio.load` đọc được mp3) và lấy stem bằng
-`vocals_idx = model.sources.index("vocals")` — **không hardcode index**
-(thứ tự stem mâu thuẫn giữa các nguồn tài liệu).
+**Đường chính (đã chốt khi triển khai):** dùng API gốc cấp thấp
+`demucs.pretrained.get_model("htdemucs")` + `demucs.apply.apply_model(..., overlap=0.25)` +
+`demucs.audio.AudioFile(...).read(...)` / `demucs.audio.save_audio(...)`. Lý do: module
+`demucs.api.Separator` **không có trong bản PyPI demucs 4.0.1** (kiểm chứng trực tiếp trên
+máy chạy: thư mục package thiếu `api.py`), nên không dùng được. Đường low-level này có trong
+**mọi** bản demucs 4.x.
+- Đọc audio bằng `AudioFile(...).read(streams=0, samplerate=model.samplerate, channels=model.audio_channels)`
+  (tự decode mp3 qua ffmpeg nội bộ, resample về 44100/stereo).
+- Chuẩn hóa theo `demucs/separate.py` (`(wav-ref.mean())/ref.std()` rồi nhân/cộng lại) trước/sau `apply_model`.
+- Lấy stem bằng `vocals_idx = model.sources.index("vocals")` — **không hardcode index**
+  (thứ tự là `['drums','bass','other','vocals']` nhưng vẫn lấy theo tên cho an toàn).
+- Ghi WAV tạm bằng `save_audio(vocals, tmp, model.samplerate)`.
 
 Sau khi có stem vocals (stereo, sr gốc ~44100) → ghi WAV tạm → post-process bằng ffmpeg
 (tối giản — Demucs đã khử nền nên **không** thêm afftdn). Lệnh **minh họa** (giá trị thật nối

@@ -1,5 +1,3 @@
-import sys
-import types
 import pytest
 
 
@@ -15,34 +13,37 @@ def test_pick_device_auto():
     assert _pick_device(None, False) == "cpu"
 
 
-def test_load_demucs_builds_separator(monkeypatch):
-    # fake Separator qua seam _ensure_demucs -> khong cham demucs/pip that
+def test_load_demucs_loads_model(monkeypatch):
+    # fake model qua seam _ensure_demucs_model -> khong cham demucs/pip that
     import audio_denoise
-    created = {}
+    rec = {}
 
-    class FakeSeparator:
-        def __init__(self, model=None, device=None, overlap=None):
-            created["model"] = model
-            created["device"] = device
-            created["overlap"] = overlap
+    class FakeModel:
+        def to(self, dev):
+            rec["dev"] = dev
+            return self
 
-    monkeypatch.setattr(audio_denoise, "_ensure_demucs", lambda: FakeSeparator)
+        def eval(self):
+            rec["eval"] = True
+            return self
+
+    fake = FakeModel()
+    monkeypatch.setattr(audio_denoise, "_ensure_demucs_model", lambda: fake)
     monkeypatch.setattr(audio_denoise, "_cuda_available", lambda: False)
-    sep = audio_denoise.load_demucs()
-    assert isinstance(sep, FakeSeparator)
-    assert created["model"] == "htdemucs"
-    assert created["device"] == "cpu"
-    assert created["overlap"] == 0.25
+    m = audio_denoise.load_demucs()
+    assert m is fake
+    assert rec["dev"] == "cpu"          # device chon dung
+    assert rec["eval"] is True          # da chuyen sang eval mode
 
 
 def test_load_demucs_raises_when_unavailable(monkeypatch):
-    # _ensure_demucs raise -> load_demucs propagate, KHONG chay pip that
+    # _ensure_demucs_model raise -> load_demucs propagate, KHONG chay pip that
     import audio_denoise
 
     def boom():
         raise ImportError("no demucs")
 
-    monkeypatch.setattr(audio_denoise, "_ensure_demucs", boom)
+    monkeypatch.setattr(audio_denoise, "_ensure_demucs_model", boom)
     with pytest.raises(ImportError):
         audio_denoise.load_demucs()
 
@@ -87,27 +88,24 @@ class _FakeTensor:
         return self
 
 
-class _FakeSep:
+class _FakeModel:
+    sources = ["drums", "bass", "other", "vocals"]   # thu tu stem cua htdemucs
     samplerate = 44100
-    def __init__(self, raise_it=False):
-        self.raise_it = raise_it
-    def separate_audio_file(self, path):
-        if self.raise_it:
-            raise RuntimeError("boom")
-        # tra nhieu stem; phai chon "vocals" theo TEN
-        return None, {"drums": _FakeTensor("drums"),
-                      "other": _FakeTensor("other"),
-                      "vocals": _FakeTensor("vocals")}
+    audio_channels = 2
 
 
 def test_separate_vocals_picks_named_stem(monkeypatch, tmp_path):
     import audio_denoise
     saved = {}
-    fake_ta = types.ModuleType("torchaudio")
-    fake_ta.save = lambda p, t, sr: saved.update(path=p, tensor=t, sr=sr)
-    monkeypatch.setitem(sys.modules, "torchaudio", fake_ta)
+    # 4 stem dung thu tu demucs; phai chon "vocals" theo TEN (= index 3)
+    sources = [_FakeTensor("drums"), _FakeTensor("bass"),
+               _FakeTensor("other"), _FakeTensor("vocals")]
+    monkeypatch.setattr(audio_denoise, "_read_audio", lambda i, m: "wav")
+    monkeypatch.setattr(audio_denoise, "_apply_demucs", lambda m, w: sources)
+    monkeypatch.setattr(audio_denoise, "_save_wav",
+                        lambda wav, p, sr: saved.update(tensor=wav, path=p, sr=sr))
 
-    out = audio_denoise.separate_vocals("in.mp3", _FakeSep(), tmp_path / "v.wav")
+    out = audio_denoise.separate_vocals("in.mp3", _FakeModel(), tmp_path / "v.wav")
     assert saved["tensor"].tag == "vocals"     # chon dung stem vocals theo ten
     assert saved["sr"] == 44100
     assert out == tmp_path / "v.wav"
@@ -116,11 +114,11 @@ def test_separate_vocals_picks_named_stem(monkeypatch, tmp_path):
 def test_denoise_file_ok(monkeypatch, tmp_path):
     import audio_denoise
     monkeypatch.setattr(audio_denoise, "separate_vocals",
-                        lambda i, s, t: Path(t))
+                        lambda i, m, t: Path(t))
     monkeypatch.setattr(audio_denoise, "_post_process",
                         lambda i, o, f: True)
     out = tmp_path / "out.wav"
-    assert audio_denoise.denoise_file("in.mp3", out, _FakeSep(), "ffmpeg") is True
+    assert audio_denoise.denoise_file("in.mp3", out, _FakeModel(), "ffmpeg") is True
 
 
 def test_denoise_file_returns_false_on_error(monkeypatch, tmp_path):
@@ -131,7 +129,7 @@ def test_denoise_file_returns_false_on_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(audio_denoise, "separate_vocals", boom)
     out = tmp_path / "out.wav"
-    assert audio_denoise.denoise_file("in.mp3", out, _FakeSep(), "ffmpeg") is False
+    assert audio_denoise.denoise_file("in.mp3", out, _FakeModel(), "ffmpeg") is False
 
 
 # ── Task 4 tests ──────────────────────────────────────────────────────────────
