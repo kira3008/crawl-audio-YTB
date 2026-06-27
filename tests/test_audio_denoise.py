@@ -130,3 +130,48 @@ def test_denoise_file_returns_false_on_error(monkeypatch, tmp_path):
     monkeypatch.setattr(audio_denoise, "separate_vocals", boom)
     out = tmp_path / "out.wav"
     assert audio_denoise.denoise_file("in.mp3", out, _FakeSep(), "ffmpeg") is False
+
+
+# ── Task 4 tests ──────────────────────────────────────────────────────────────
+
+def test_denoise_batch_loads_once_and_maps(monkeypatch, tmp_path):
+    import audio_denoise
+    calls = {"load": 0}
+    monkeypatch.setattr(audio_denoise, "load_demucs",
+                        lambda: calls.__setitem__("load", calls["load"] + 1) or object())
+    monkeypatch.setattr(audio_denoise, "denoise_file",
+                        lambda i, o, s, f: True)
+    ins = [tmp_path / "a.mp3", tmp_path / "b.mp3"]
+    out = audio_denoise.denoise_batch(ins, tmp_path / "den", "ffmpeg")
+    assert calls["load"] == 1
+    assert set(out.keys()) == set(ins)
+    assert out[ins[0]] == tmp_path / "den" / "a.wav"
+
+
+def test_denoise_batch_abort_on_load_fail(monkeypatch, tmp_path):
+    import audio_denoise
+
+    def boom():
+        raise RuntimeError("no gpu")
+
+    monkeypatch.setattr(audio_denoise, "load_demucs", boom)
+    called = {"file": 0}
+    monkeypatch.setattr(audio_denoise, "denoise_file",
+                        lambda *a, **k: called.__setitem__("file", 1) or True)
+    out = audio_denoise.denoise_batch([tmp_path / "a.mp3"], tmp_path / "den", "ffmpeg")
+    assert out == {}
+    assert called["file"] == 0      # khong cat tho file nao
+
+
+def test_denoise_batch_skips_failed_file(monkeypatch, tmp_path):
+    import audio_denoise
+    monkeypatch.setattr(audio_denoise, "load_demucs", lambda: object())
+
+    def half(i, o, s, f):
+        return i.name == "a.mp3"
+
+    monkeypatch.setattr(audio_denoise, "denoise_file", half)
+    ins = [tmp_path / "a.mp3", tmp_path / "b.mp3"]
+    out = audio_denoise.denoise_batch(ins, tmp_path / "den", "ffmpeg")
+    assert (tmp_path / "a.mp3") in out
+    assert (tmp_path / "b.mp3") not in out

@@ -85,3 +85,31 @@ def denoise_file(in_path, out_path, separator, ffmpeg_exe) -> bool:
             tmp.unlink()
         except OSError:
             pass
+
+
+def denoise_batch(in_paths, out_dir, ffmpeg_exe, console=None):
+    from pathlib import Path
+    out_dir = Path(out_dir)
+
+    def log(msg):
+        if console:
+            console.print(msg)
+        else:
+            print(msg)
+
+    try:
+        separator = load_demucs()
+    except Exception as e:
+        log(f"[red]✗ Demucs khong kha dung ({e}) — bo qua denoise, KHONG cat tho.[/red]")
+        return {}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result: dict = {}
+    for p in in_paths:
+        p = Path(p)
+        out_path = out_dir / f"{p.stem}.wav"
+        if denoise_file(p, out_path, separator, ffmpeg_exe):
+            result[p] = out_path
+        else:
+            log(f"[yellow]⚠ Skip (denoise loi): {p.name}[/yellow]")
+    return result
