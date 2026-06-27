@@ -94,3 +94,8 @@ def test_discover_empty_defaults_to_downloads(tmp_path, monkeypatch):
     tr, mp3 = jobs[0]
     assert tr == Path("downloads") / "transcript" / "f.json"
     assert mp3 == Path("downloads") / "audio" / "f.mp3"
+
+
+def test_old_helpers_removed():
+    assert not hasattr(split_audio, "plan_split_sources")
+    assert not hasattr(split_audio, "collect_json_files")

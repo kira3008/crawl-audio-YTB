@@ -337,17 +337,6 @@ def _segments_root(mp3: Path) -> Path:
     return mp3.parent
 
 
-def collect_json_files(paths: list[Path]) -> list[Path]:
-    result: list[Path] = []
-    for p in paths:
-        if p.is_dir():
-            result.extend(f for f in sorted(p.glob("*.json"))
-                          if f.name != "manifest.json")
-        elif p.suffix.lower() == ".json" and p.exists():
-            result.append(p)
-    return result
-
-
 def discover_split_jobs(inputs: list[Path]) -> list[tuple[Path, Path]]:
     if not inputs:
         inputs = [Path("downloads")]
@@ -400,16 +389,6 @@ def discover_split_jobs(inputs: list[Path]) -> list[tuple[Path, Path]]:
                 add(jf, jf.with_suffix(".mp3"))
 
     return jobs
-
-
-def plan_split_sources(json_files, denoise_map):
-    """Map json -> cleaned wav; bo json nao khong co source da denoise."""
-    pairs = []
-    for jf in json_files:
-        src = denoise_map.get(jf.with_suffix(".mp3"))
-        if src is not None:
-            pairs.append((jf, src))
-    return pairs
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -466,53 +445,17 @@ def main():
                     f"[yellow]⚠ VAD failed ({e}), using --no-vad fallback[/yellow]\n"
                 )
 
-    if args.inputs:
-        json_files = collect_json_files([Path(p) for p in args.inputs])
-    else:
-        try:
-            import questionary
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "questionary"])
-            import questionary
-
-        downloads = Path("downloads")
-        candidates = sorted(f for f in downloads.glob("*.json")
-                            if f.name != "manifest.json") if downloads.exists() else []
-        if not candidates:
-            candidates = sorted(f for f in Path(".").glob("*.json")
-                                if f.name != "manifest.json")
-        if not candidates:
-            console.print("[red]Không tìm thấy file JSON nào.[/red]")
-            return
-
-        selected = questionary.checkbox(
-            "Chọn file JSON:",
-            choices=[questionary.Choice(p.name, value=p, checked=True)
-                     for p in candidates],
-        ).ask()
-        if not selected:
-            return
-        json_files = selected
-
-        default_out = str(candidates[0].parent / "segments")
-        out_raw = questionary.text("Thư mục lưu:", default=default_out).ask()
-        if out_raw is None:
-            return
-        args.output = out_raw
-
-    if not json_files:
-        console.print("[red]Không có file JSON nào.[/red]")
+    jobs = discover_split_jobs([Path(p) for p in args.inputs])
+    if not jobs:
+        console.print("[red]Không tìm thấy cặp transcript + audio nào trong downloads/.[/red]")
         return
 
-    from audio_denoise import denoise_batch
-    mp3_inputs = [jf.with_suffix(".mp3") for jf in json_files]
-    if args.inspect:
-        split_pairs = [(jf, None) for jf in json_files]
-    else:
+    denoise_map: dict = {}
+    if not args.inspect:
+        from audio_denoise import denoise_batch
         console.print("[bold]Đang lọc nhiễu (Demucs)…[/bold]")
-        denoise_map = denoise_batch(mp3_inputs, ffmpeg_exe, console=console)
-        split_pairs = plan_split_sources(json_files, denoise_map)
-        if not split_pairs:
+        denoise_map = denoise_batch([mp3 for _, mp3 in jobs], ffmpeg_exe, console=console)
+        if not denoise_map:
             console.print("[red]Không có file nào denoise thành công — dừng.[/red]")
             return
 
@@ -522,12 +465,15 @@ def main():
                   BarColumn(), MofNCompleteColumn(),
                   console=console, transient=False) as progress:
 
-        for jf, src in split_pairs:
-            out_root = Path(args.output) if args.output else jf.parent / "segments"
-            task = progress.add_task(jf.stem[:50], total=None)
+        for tr, mp3 in jobs:
+            src = mp3 if args.inspect else denoise_map.get(mp3)
+            if src is None:
+                continue
+            out_root = Path(args.output) if args.output else _segments_root(mp3) / "segments"
+            task = progress.add_task(_base_name(tr)[:50], total=None)
 
             ok, err = split_one(
-                json_path=jf,
+                json_path=tr,
                 output_root=out_root,
                 ffmpeg_exe=ffmpeg_exe,
                 vad_model=vad_model,
@@ -543,7 +489,7 @@ def main():
             if err:
                 status += f" [red]✗ {err} lỗi[/red]"
             progress.update(task, completed=1, total=1,
-                            description=f"{jf.stem[:40]} — {status}")
+                            description=f"{_base_name(tr)[:40]} — {status}")
 
     console.print(Panel(
         "\n".join(filter(None, [
