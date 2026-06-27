@@ -366,7 +366,7 @@ def discover_split_jobs(inputs: list[Path]) -> list[tuple[Path, Path]]:
         if jf.parent.name in ("transcript", "transcript_clean") \
                 and (jf.parent.parent / "audio").is_dir():
             return jf.parent.parent / "audio" / f"{base}.mp3"
-        return jf.with_suffix(".mp3")
+        return jf.parent / f"{base}.mp3"
 
     for p in inputs:
         p = Path(p)

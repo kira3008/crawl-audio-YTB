@@ -76,6 +76,14 @@ def test_discover_single_clean_json_resolves_audio(tmp_path):
     assert jobs == [(cj, tmp_path / "audio" / "e.mp3")]
 
 
+def test_discover_single_flat_clean_json(tmp_path):
+    cj = tmp_path / "g.clean.json"
+    cj.write_text("[]", encoding="utf-8")
+    (tmp_path / "g.mp3").write_bytes(b"x")
+    jobs = split_audio.discover_split_jobs([cj])
+    assert jobs == [(cj, tmp_path / "g.mp3")]
+
+
 def test_discover_empty_defaults_to_downloads(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _touch(tmp_path / "downloads" / "transcript" / "f.json")
