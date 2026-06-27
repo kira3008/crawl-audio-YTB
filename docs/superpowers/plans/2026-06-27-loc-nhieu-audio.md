@@ -52,8 +52,6 @@ HIGHPASS_HZ      = 80
 
 ```python
 # tests/test_audio_denoise.py
-import sys
-import types
 import pytest
 
 
@@ -70,7 +68,8 @@ def test_pick_device_auto():
 
 
 def test_load_demucs_builds_separator(monkeypatch):
-    # fake demucs.api.Separator để không cần cài demucs that
+    # fake Separator qua seam _ensure_demucs -> khong cham demucs/pip that
+    import audio_denoise
     created = {}
 
     class FakeSeparator:
@@ -78,13 +77,7 @@ def test_load_demucs_builds_separator(monkeypatch):
             created["model"] = model
             created["device"] = device
 
-    fake_api = types.ModuleType("demucs.api")
-    fake_api.Separator = FakeSeparator
-    fake_pkg = types.ModuleType("demucs")
-    monkeypatch.setitem(sys.modules, "demucs", fake_pkg)
-    monkeypatch.setitem(sys.modules, "demucs.api", fake_api)
-
-    import audio_denoise
+    monkeypatch.setattr(audio_denoise, "_ensure_demucs", lambda: FakeSeparator)
     monkeypatch.setattr(audio_denoise, "_cuda_available", lambda: False)
     sep = audio_denoise.load_demucs()
     assert isinstance(sep, FakeSeparator)
@@ -93,10 +86,13 @@ def test_load_demucs_builds_separator(monkeypatch):
 
 
 def test_load_demucs_raises_when_unavailable(monkeypatch):
+    # _ensure_demucs raise -> load_demucs propagate, KHONG chay pip that
     import audio_denoise
-    # gia lap import demucs.api that bai va pip install cung that bai
-    monkeypatch.setattr(audio_denoise, "_import_separator",
-                        lambda: (_ for _ in ()).throw(ImportError("no demucs")))
+
+    def boom():
+        raise ImportError("no demucs")
+
+    monkeypatch.setattr(audio_denoise, "_ensure_demucs", boom)
     with pytest.raises(ImportError):
         audio_denoise.load_demucs()
 ```
@@ -139,17 +135,18 @@ def _pick_device(device, cuda_available: bool) -> str:
     return "cuda" if cuda_available else "cpu"
 
 
-def _import_separator():
-    from demucs.api import Separator
+def _ensure_demucs():
+    # seam testable: lazy-install demucs neu thieu, tra ve class Separator
+    try:
+        from demucs.api import Separator
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "demucs"])
+        from demucs.api import Separator
     return Separator
 
 
 def load_demucs(device=None):
-    try:
-        Separator = _import_separator()
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "demucs"])
-        Separator = _import_separator()
+    Separator = _ensure_demucs()
     dev = _pick_device(device, _cuda_available())
     return Separator(model=DEMUCS_MODEL, device=dev)
 ```
