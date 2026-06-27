@@ -42,3 +42,21 @@ def load_demucs(device=None):
     Separator = _ensure_demucs()
     dev = _pick_device(device, _cuda_available())
     return Separator(model=DEMUCS_MODEL, device=dev)
+
+
+def _post_filter() -> str:
+    return (f"highpass=f={HIGHPASS_HZ}:p=2,"
+            f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}")
+
+
+def _post_process(in_wav, out_path, ffmpeg_exe) -> bool:
+    cmd = [
+        ffmpeg_exe, "-y", "-loglevel", "error",
+        "-i", str(in_wav),
+        "-af", _post_filter(),
+        "-ar", str(TARGET_SR),
+        "-ac", str(TARGET_CHANNELS),
+        "-c:a", "pcm_s16le",
+        str(out_path),
+    ]
+    return subprocess.run(cmd, capture_output=True).returncode == 0

@@ -41,3 +41,31 @@ def test_load_demucs_raises_when_unavailable(monkeypatch):
     monkeypatch.setattr(audio_denoise, "_ensure_demucs", boom)
     with pytest.raises(ImportError):
         audio_denoise.load_demucs()
+
+
+def test_post_filter_from_constants():
+    from audio_denoise import _post_filter
+    f = _post_filter()
+    assert "highpass=f=80:p=2" in f
+    assert "loudnorm=I=-23:TP=-1.5:LRA=11" in f
+
+
+def test_post_process_builds_cmd(monkeypatch):
+    import audio_denoise
+    captured = {}
+
+    class R:
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        return R()
+
+    monkeypatch.setattr(audio_denoise.subprocess, "run", fake_run)
+    ok = audio_denoise._post_process("in.wav", "out.wav", "ffmpeg")
+    assert ok is True
+    cmd = captured["cmd"]
+    assert "ffmpeg" == cmd[0]
+    assert "-af" in cmd and audio_denoise._post_filter() in cmd
+    assert "22050" in cmd and "pcm_s16le" in cmd
+    assert cmd[cmd.index("-ac") + 1] == "1"
