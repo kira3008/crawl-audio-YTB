@@ -33,3 +33,11 @@ def test_inspect_empty_words_no_error(tmp_path):
 
     assert err_count == 0
     assert ok_count > 0
+
+
+def test_plan_split_sources_filters_to_denoised():
+    j1, j2 = Path("a.json"), Path("b.json")
+    den = {Path("a.mp3"): Path("den/a.wav")}   # chi a.mp3 denoise OK
+    # map theo mp3 sibling cua json
+    pairs = split_audio.plan_split_sources([j1, j2], den)
+    assert pairs == [(j1, Path("den/a.wav"))]   # b bi bo vi denoise loi

@@ -331,6 +331,16 @@ def collect_json_files(paths: list[Path]) -> list[Path]:
     return result
 
 
+def plan_split_sources(json_files, denoise_map):
+    """Map json -> cleaned wav; bo json nao khong co source da denoise."""
+    pairs = []
+    for jf in json_files:
+        src = denoise_map.get(jf.with_suffix(".mp3"))
+        if src is not None:
+            pairs.append((jf, src))
+    return pairs
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -423,13 +433,23 @@ def main():
         console.print("[red]Không có file JSON nào.[/red]")
         return
 
+    from audio_denoise import denoise_batch
+    mp3_inputs = [jf.with_suffix(".mp3") for jf in json_files]
+    denoise_dir = json_files[0].parent / "audio_denoised"
+    console.print("[bold]Đang lọc nhiễu (Demucs)…[/bold]")
+    denoise_map = denoise_batch(mp3_inputs, denoise_dir, ffmpeg_exe, console=console)
+    split_pairs = plan_split_sources(json_files, denoise_map)
+    if not split_pairs:
+        console.print("[red]Không có file nào denoise thành công — dừng.[/red]")
+        return
+
     total_ok = total_err = 0
 
     with Progress(SpinnerColumn(), TextColumn("[bold white]{task.description}"),
                   BarColumn(), MofNCompleteColumn(),
                   console=console, transient=False) as progress:
 
-        for jf in json_files:
+        for jf, src in split_pairs:
             out_root = Path(args.output) if args.output else jf.parent / "segments"
             task = progress.add_task(jf.stem[:50], total=None)
 
@@ -441,6 +461,7 @@ def main():
                 console=console if args.inspect else None,
                 inspect=args.inspect,
                 breath_gap=args.breath_gap,
+                source=src,
             )
             total_ok  += ok
             total_err += err
