@@ -171,6 +171,9 @@ def find_vad_boundaries(group_entries: list[dict],
 # ── entry loader ─────────────────────────────────────────────────────────────
 
 def load_entries_for_split(json_path: Path) -> list[dict]:
+    if json_path.name.endswith(".clean.json"):
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        return [e for e in data if e.get("type", "dialogue") == "dialogue"]
     clean = json_path.with_suffix(".clean.json")
     if clean.exists():
         data = json.loads(clean.read_text(encoding="utf-8"))
