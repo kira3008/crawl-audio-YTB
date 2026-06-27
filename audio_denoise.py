@@ -60,3 +60,28 @@ def _post_process(in_wav, out_path, ffmpeg_exe) -> bool:
         str(out_path),
     ]
     return subprocess.run(cmd, capture_output=True).returncode == 0
+
+
+def separate_vocals(in_path, separator, tmp_wav):
+    import torchaudio
+    _, stems = separator.separate_audio_file(str(in_path))
+    vocals = stems["vocals"]          # chon theo TEN, khong hardcode index
+    torchaudio.save(str(tmp_wav), vocals.cpu(), separator.samplerate)
+    return tmp_wav
+
+
+def denoise_file(in_path, out_path, separator, ffmpeg_exe) -> bool:
+    from pathlib import Path
+    tmp = Path(out_path).with_suffix(".vocals.wav")
+    try:
+        separate_vocals(in_path, separator, tmp)
+        ok = _post_process(tmp, out_path, ffmpeg_exe)
+        return ok
+    except Exception as e:
+        print(f"[denoise] loi {in_path}: {e}")
+        return False
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
