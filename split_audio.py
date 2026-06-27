@@ -188,6 +188,7 @@ def split_one(
     console=None,
     inspect: bool = False,
     breath_gap: float = 0.2,
+    source: Path | None = None,
 ) -> tuple[int, int]:
 
     def log(msg):
@@ -196,9 +197,10 @@ def split_one(
         else:
             print(re.sub(r"\[/?[\w ]+\]", "", msg))
 
-    mp3_path = json_path.with_suffix(".mp3")
-    if not mp3_path.exists():
-        log(f"[red]✗ Không tìm thấy MP3: {mp3_path.name}[/red]")
+    src_path = source if source is not None else json_path.with_suffix(".mp3")
+    seg_ext  = src_path.suffix          # ".wav" khi da denoise, ".mp3" khi khong
+    if not src_path.exists():
+        log(f"[red]✗ Không tìm thấy MP3: {src_path.name}[/red]")
         return 0, 1
 
     entries: list[dict] = load_entries_for_split(json_path)
@@ -214,7 +216,7 @@ def split_one(
     all_vad: list[dict] = []
     if vad_model is not None:
         try:
-            all_vad = run_vad(str(mp3_path.resolve()), vad_model, ffmpeg_exe)
+            all_vad = run_vad(str(src_path.resolve()), vad_model, ffmpeg_exe)
         except Exception as e:
             log(f"[yellow]⚠ VAD lỗi ({e}), dùng Whisper timestamps[/yellow]")
 
@@ -264,7 +266,7 @@ def split_one(
         ents  = group["entries"]
         text  = " ".join(e.get("text", "").strip() for e in ents)
         label = sanitize_filename(ents[0].get("text", "") if ents else "", max_len=80)
-        filename    = f"{i:04d}_{label}.mp3"
+        filename    = f"{i:04d}_{label}{seg_ext}"
         out_path    = seg_dir / filename
         duration_ms = round((group["end_sec"] - group["start_sec"]) * 1000)
 
@@ -284,7 +286,7 @@ def split_one(
         cmd = [
             ffmpeg_exe, "-y", "-loglevel", "error",
             "-ss", start, "-to", end,
-            "-i", str(mp3_path),
+            "-i", str(src_path),
             "-c", "copy", str(out_path),
         ]
         result = subprocess.run(cmd, capture_output=True)
@@ -294,14 +296,17 @@ def split_one(
             err_count += 1
             continue
 
-        manifest.append({
+        entry = {
             "file":        filename,
             "start":       start,
             "end":         end,
             "duration_ms": duration_ms,
             "entries":     len(ents),
             "text":        text,
-        })
+        }
+        if source is not None:
+            entry["denoise"] = True
+        manifest.append(entry)
         ok_count += 1
 
     if manifest:
