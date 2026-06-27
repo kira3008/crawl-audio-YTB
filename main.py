@@ -14,6 +14,24 @@ from transcribe_backends import load_local_model, transcribe_local
 YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]
 STALL_SECONDS = 60  # seconds without byte progress → show stall warning
 
+# Chia đợt tải để tránh YouTube quét khi crawl số lượng lớn.
+# > BATCH_THRESHOLD video → tải theo đợt BATCH_SIZE, nghỉ BATCH_COOLDOWN_SEC giữa các đợt.
+BATCH_THRESHOLD    = 100   # ≤ ngưỡng này: tải một mạch
+BATCH_SIZE         = 50    # số video mỗi đợt khi vượt ngưỡng
+BATCH_COOLDOWN_SEC = 300   # nghỉ 5 phút giữa các đợt
+
+# Thư mục con dưới output_dir để dễ quản lý.
+AUDIO_SUBDIR      = "audio"             # file .mp3
+TRANSCRIPT_SUBDIR = "transcript"        # transcript thô .json
+CLEAN_SUBDIR      = "transcript_clean"  # transcript đã lọc .clean.json
+
+# Cookies chống YouTube bot-check khi tải số lượng lớn. Đặt qua menu trong main().
+# _COOKIES_BROWSER: đọc trực tiếp từ trình duyệt (máy cá nhân, vd "chrome").
+# _COOKIES_FILE: đường dẫn file cookies.txt (dùng cho server/headless không có browser).
+# Ưu tiên file nếu cả hai cùng có.
+_COOKIES_BROWSER: str | None = None
+_COOKIES_FILE: str | None = None
+
 _vi_base = (
     "àáâãèéêìíòóôõùúýăđơư"
     "ạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹỵ"
@@ -152,6 +170,12 @@ def search_videos(keyword: str, fetch_count: int, proxy: str | None = None,
     ]
     if proxy:
         cmd += ["--proxy", proxy]
+    cookies_file    = globals().get("_COOKIES_FILE")
+    cookies_browser = globals().get("_COOKIES_BROWSER")
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    elif cookies_browser:
+        cmd += ["--cookies-from-browser", cookies_browser]
     cmd += [f"ytsearch{fetch_count}:{keyword}"]
     result = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
@@ -214,7 +238,7 @@ def search_until_enough(keyword: str, needed: int, status_fn=None,
 
 def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "local") -> bool:
     import logging
-    mp3_path = Path(output_dir) / f"{safe_title}.mp3"
+    mp3_path = Path(output_dir) / AUDIO_SUBDIR / f"{safe_title}.mp3"
     if not mp3_path.exists():
         logging.warning(f"[transcribe] MP3 not found: {mp3_path}")
         return False
@@ -233,7 +257,8 @@ def transcribe_audio(safe_title: str, output_dir: str, model, backend: str = "lo
         if not entries:
             logging.warning(f"[transcribe] No segments: {mp3_path}")
             return False
-        json_path = Path(output_dir) / f"{safe_title}.json"
+        json_path = Path(output_dir) / TRANSCRIPT_SUBDIR / f"{safe_title}.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(entries, f, ensure_ascii=False, indent=2)
         return True
@@ -286,7 +311,19 @@ def _download_attempt(
     fragments = 16 if duration > 1800 else 8
 
     safe_title       = sanitize_filename(video["title"])
-    output_template  = str(Path(output_dir) / f"{safe_title}.%(ext)s")
+    output_template  = str(Path(output_dir) / AUDIO_SUBDIR / f"{safe_title}.%(ext)s")
+
+    # pacing chống bot-check: có proxy → xoay IP nên nhanh; có cookies → đã auth
+    # nên nhẹ tay; không cả hai → giãn request để tránh bị chặn khi tải số lượng lớn
+    cookies_browser = globals().get("_COOKIES_BROWSER")
+    cookies_file    = globals().get("_COOKIES_FILE")
+    has_cookies     = bool(cookies_browser or cookies_file)
+    if proxy:
+        sleep_min, sleep_max, sleep_req = 0, 0, 0
+    elif has_cookies:
+        sleep_min, sleep_max, sleep_req = 1, 3, 1
+    else:
+        sleep_min, sleep_max, sleep_req = 3, 7, 2
 
     ydl_opts: dict = {
         "format": "bestaudio/best",
@@ -303,15 +340,18 @@ def _download_attempt(
         "noprogress":  True,
         "retries":          5,
         "fragment_retries": 5,
-        # sleep thấp hơn khi có proxy (xoay IP → ít bị 429)
-        "sleep_interval":          0 if proxy else 1,
-        "max_sleep_interval":      0 if proxy else 2,
-        "sleep_interval_requests": 0 if proxy else 1,
+        "sleep_interval":          sleep_min,
+        "max_sleep_interval":      sleep_max,
+        "sleep_interval_requests": sleep_req,
     }
     if ffmpeg_dir:
         ydl_opts["ffmpeg_location"] = ffmpeg_dir
     if proxy:
         ydl_opts["proxy"] = proxy
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
+    elif cookies_browser:
+        ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -360,8 +400,8 @@ def get_downloaded_ids(output_dir: str) -> set[str]:
 
 
 def get_downloaded_titles(output_dir: str) -> set[str]:
-    """Return sanitized base-names of MP3 files already present in output_dir."""
-    p = Path(output_dir)
+    """Return sanitized base-names of MP3 files already present in the audio subdir."""
+    p = Path(output_dir) / AUDIO_SUBDIR
     if not p.exists():
         return set()
     return {f.stem for f in p.glob("*.mp3")}
@@ -384,6 +424,22 @@ def _append_link(video: dict, output_dir: str):
     line = f"- [{video['title']}]({video['url']}) — {video['channel']} `{format_duration(video.get('duration'))}`\n"
     with open(links_file, "a", encoding="utf-8") as f:
         f.write(line)
+
+
+def _cooldown(progress, seconds: int):
+    """Nghỉ giữa các đợt tải, hiển thị đếm ngược. Transcribe vẫn chạy nền."""
+    tid = progress.add_task(
+        "", total=seconds, title="⏸ Nghỉ tránh quét", status="",
+    )
+    for elapsed in range(seconds):
+        remaining = seconds - elapsed
+        progress.update(
+            tid, completed=elapsed,
+            status=f"[yellow]đợt tiếp sau {remaining // 60}:{remaining % 60:02d}[/yellow]",
+        )
+        time.sleep(1)
+    progress.update(tid, completed=seconds, status="[green]tiếp tục[/green]")
+    progress.remove_task(tid)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -482,6 +538,28 @@ def main():
             n = pool.refresh()
         console.print(f"[green]✓ {n} proxy sống[/green]")
         pool.start_background(interval_sec=600)
+
+    cookies_txt = Path("cookies.txt")
+    cookie_choices = ["Không dùng"]
+    if cookies_txt.exists():
+        cookie_choices.append("File cookies.txt (đã có sẵn — dùng cho server/headless)")
+    cookie_choices += ["Chrome", "Edge", "Firefox", "Brave"]
+
+    cookies_choice = questionary.select(
+        "Dùng cookies? (giải pháp tốt nhất chống YouTube chặn khi tải số lượng lớn):",
+        choices=cookie_choices,
+        default="Không dùng",
+    ).ask()
+    if cookies_choice is None:
+        return
+    if cookies_choice.startswith("File cookies.txt"):
+        globals()["_COOKIES_FILE"] = str(cookies_txt.resolve())
+        console.print(f"[dim]Cookies: {cookies_txt.resolve()}[/dim]")
+    elif cookies_choice != "Không dùng":
+        globals()["_COOKIES_BROWSER"] = cookies_choice.lower()
+        console.print(
+            f"[dim]Cookies: {cookies_choice} — nhớ đóng trình duyệt nếu bị lỗi khóa cookies[/dim]"
+        )
 
     import os
     try:
@@ -616,6 +694,8 @@ def main():
 
     # ── skip already-downloaded ───────────────────────────────────────────────
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    for sub in (AUDIO_SUBDIR, TRANSCRIPT_SUBDIR, CLEAN_SUBDIR):
+        (Path(output_dir) / sub).mkdir(parents=True, exist_ok=True)
     existing_ids    = get_downloaded_ids(output_dir)
     existing_titles = get_downloaded_titles(output_dir)
 
@@ -738,7 +818,11 @@ def main():
                 if has_script:
                     try:
                         from clean_transcript import clean_file
-                        clean_file(Path(output_dir) / f"{safe}.json", client=clean_client)
+                        clean_file(
+                            Path(output_dir) / TRANSCRIPT_SUBDIR / f"{safe}.json",
+                            client=clean_client,
+                            out_dir=Path(output_dir) / CLEAN_SUBDIR,
+                        )
                     except Exception:
                         pass
                 _append_link(vid, output_dir)
@@ -753,29 +837,47 @@ def main():
         for w in t_workers:
             w.start()
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(
-                    download_with_rotation, v, output_dir, ffmpeg_dir,
-                    progress, task_map[v["id"]], pool,
-                ): v
-                for v in to_download
-            }
+        # > BATCH_THRESHOLD video → chia đợt BATCH_SIZE, nghỉ giữa các đợt tránh bị quét
+        if len(to_download) > BATCH_THRESHOLD:
+            batches = [
+                to_download[i:i + BATCH_SIZE]
+                for i in range(0, len(to_download), BATCH_SIZE)
+            ]
+            progress.console.print(
+                f"[yellow]⏳ Tải số lượng lớn ({len(to_download)} video) — "
+                f"chia {len(batches)} đợt × {BATCH_SIZE}, nghỉ "
+                f"{BATCH_COOLDOWN_SEC // 60} phút giữa các đợt.[/yellow]\n"
+            )
+        else:
+            batches = [to_download]
 
-            for future in as_completed(future_map):
-                video = future_map[future]
-                tid   = task_map[video["id"]]
-                try:
-                    ok = future.result()
-                except Exception:
-                    ok = False
+        for bi, batch in enumerate(batches):
+            if bi > 0:
+                _cooldown(progress, BATCH_COOLDOWN_SEC)
 
-                if ok:
-                    success.append(video)
-                    transcribe_q.put((video, tid))
-                else:
-                    progress.update(tid, status="[red]✗ Lỗi[/red]")
-                    failed.append(video)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        download_with_rotation, v, output_dir, ffmpeg_dir,
+                        progress, task_map[v["id"]], pool,
+                    ): v
+                    for v in batch
+                }
+
+                for future in as_completed(future_map):
+                    video = future_map[future]
+                    tid   = task_map[video["id"]]
+                    try:
+                        ok = future.result()
+                    except Exception:
+                        ok = False
+
+                    if ok:
+                        success.append(video)
+                        transcribe_q.put((video, tid))
+                    else:
+                        progress.update(tid, status="[red]✗ Lỗi[/red]")
+                        failed.append(video)
 
         # Gửi sentinel cho mỗi worker rồi chờ hết
         for _ in t_workers:
@@ -787,7 +889,7 @@ def main():
     out = Path(output_dir)
     script_count = sum(
         1 for v in success
-        if (out / f"{sanitize_filename(v['title'])}.json").exists()
+        if (out / TRANSCRIPT_SUBDIR / f"{sanitize_filename(v['title'])}.json").exists()
     )
 
     if pool is not None:

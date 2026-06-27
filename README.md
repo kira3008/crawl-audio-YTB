@@ -111,10 +111,13 @@ Proxy pool tự fetch thêm proxy free, validate song song, và xoay IP khi craw
 
 ```
 downloads/
-├── Nhạc Trẻ Hay Nhất 2024.mp3          # audio
-├── Nhạc Trẻ Hay Nhất 2024.json         # transcript thô (có timestamps nếu backend hỗ trợ)
-├── Nhạc Trẻ Hay Nhất 2024.clean.json   # transcript đã lọc nhiễu / chuẩn hóa
-└── crawled_links.md                    # lịch sử link đã crawl
+├── audio/
+│   └── Nhạc Trẻ Hay Nhất 2024.mp3                # file âm thanh
+├── transcript/
+│   └── Nhạc Trẻ Hay Nhất 2024.json               # transcript thô (timestamps nếu backend hỗ trợ)
+├── transcript_clean/
+│   └── Nhạc Trẻ Hay Nhất 2024.clean.json         # transcript đã lọc nhiễu / chuẩn hóa
+└── crawled_links.md                              # lịch sử link đã crawl
 ```
 
 `crawled_links.md` lưu lại link theo từng lần chạy:

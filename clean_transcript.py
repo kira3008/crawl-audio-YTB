@@ -195,11 +195,16 @@ def clean_entries(entries: list[dict], client=None, batch_size: int = 40) -> lis
     return out
 
 
-def clean_file(json_path, client=None) -> Path:
+def clean_file(json_path, client=None, out_dir=None) -> Path:
     json_path = Path(json_path)
     entries = json.loads(json_path.read_text(encoding="utf-8"))
     cleaned = clean_entries(entries, client=client)
-    out_path = json_path.with_suffix(".clean.json")
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{json_path.stem}.clean.json"
+    else:
+        out_path = json_path.with_suffix(".clean.json")
     out_path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_path
 
