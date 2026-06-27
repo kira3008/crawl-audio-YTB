@@ -253,7 +253,7 @@ def split_one(
         merged.append(g)
     all_groups = merged
 
-    seg_dir = Path(__file__).parent / output_root / json_path.stem
+    seg_dir = Path(__file__).parent / output_root / _base_name(json_path)
     if not inspect:
         seg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -319,6 +319,20 @@ def split_one(
 
 
 # ── batch ─────────────────────────────────────────────────────────────────────
+
+def _base_name(json_path: Path) -> str:
+    name = json_path.name
+    if name.endswith(".clean.json"):
+        return name[: -len(".clean.json")]
+    return json_path.stem
+
+
+def _segments_root(mp3: Path) -> Path:
+    # organized: downloads/audio/x.mp3 -> downloads ; flat: dir/x.mp3 -> dir
+    if mp3.parent.name == "audio":
+        return mp3.parent.parent
+    return mp3.parent
+
 
 def collect_json_files(paths: list[Path]) -> list[Path]:
     result: list[Path] = []
