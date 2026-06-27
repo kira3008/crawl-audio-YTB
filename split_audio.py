@@ -3,11 +3,11 @@
 split_audio.py — cắt audio theo câu (WhisperX + Silero VAD).
 
 Usage:
-    python split_audio.py                       # menu
+    python split_audio.py                       # tự động xử lý downloads/ (audio + transcript)
     python split_audio.py downloads/file.json   # 1 file
-    python split_audio.py downloads/            # cả thư mục
+    python split_audio.py downloads/            # cả thư mục (tự nhận layout)
     python split_audio.py file.json --no-vad    # chỉ dùng Whisper timestamps
-    python split_audio.py file.json --inspect   # xem cut points, không cắt
+    python split_audio.py file.json --inspect   # xem cut points, không cắt (không chạy Demucs)
 """
 
 import argparse
