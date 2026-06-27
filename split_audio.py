@@ -348,6 +348,60 @@ def collect_json_files(paths: list[Path]) -> list[Path]:
     return result
 
 
+def discover_split_jobs(inputs: list[Path]) -> list[tuple[Path, Path]]:
+    if not inputs:
+        inputs = [Path("downloads")]
+
+    jobs: list[tuple[Path, Path]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(tr: Path, mp3: Path):
+        key = (str(tr), str(mp3))
+        if tr.exists() and mp3.exists() and key not in seen:
+            seen.add(key)
+            jobs.append((tr, mp3))
+
+    def resolve_mp3_for_json(jf: Path) -> Path:
+        base = _base_name(jf)
+        if jf.parent.name in ("transcript", "transcript_clean") \
+                and (jf.parent.parent / "audio").is_dir():
+            return jf.parent.parent / "audio" / f"{base}.mp3"
+        return jf.with_suffix(".mp3")
+
+    for p in inputs:
+        p = Path(p)
+        if p.is_file() and p.suffix.lower() == ".json":
+            add(p, resolve_mp3_for_json(p))
+            continue
+        if not p.is_dir():
+            continue
+
+        audio = p / "audio"
+        traw = p / "transcript"
+        tclean = p / "transcript_clean"
+        organized = audio.is_dir() and (tclean.is_dir() or traw.is_dir())
+
+        if organized:
+            by_base: dict[str, Path] = {}
+            if traw.is_dir():
+                for jf in sorted(traw.glob("*.json")):
+                    if jf.name == "manifest.json" or jf.name.endswith(".clean.json"):
+                        continue
+                    by_base[_base_name(jf)] = jf
+            if tclean.is_dir():
+                for jf in sorted(tclean.glob("*.clean.json")):
+                    by_base[_base_name(jf)] = jf          # clean ghi de raw
+            for base, tr in sorted(by_base.items()):
+                add(tr, audio / f"{base}.mp3")
+        else:
+            for jf in sorted(p.glob("*.json")):
+                if jf.name == "manifest.json" or jf.name.endswith(".clean.json"):
+                    continue
+                add(jf, jf.with_suffix(".mp3"))
+
+    return jobs
+
+
 def plan_split_sources(json_files, denoise_map):
     """Map json -> cleaned wav; bo json nao khong co source da denoise."""
     pairs = []

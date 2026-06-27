@@ -33,3 +33,56 @@ def test_load_entries_raw_json_no_filter(tmp_path):
     ]), encoding="utf-8")
     out = split_audio.load_entries_for_split(rj)
     assert len(out) == 2
+
+
+def _touch(p: Path, text="[]"):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+
+
+def test_discover_organized_prefers_clean(tmp_path):
+    _touch(tmp_path / "transcript" / "a.json")
+    _touch(tmp_path / "transcript_clean" / "a.clean.json")
+    (tmp_path / "audio").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "audio" / "a.mp3").write_bytes(b"x")
+    jobs = split_audio.discover_split_jobs([tmp_path])
+    assert jobs == [(tmp_path / "transcript_clean" / "a.clean.json", tmp_path / "audio" / "a.mp3")]
+
+
+def test_discover_organized_fallback_raw_and_skip_missing_mp3(tmp_path):
+    _touch(tmp_path / "transcript" / "b.json")       # co transcript, KHONG co audio/b.mp3 -> bo
+    _touch(tmp_path / "transcript" / "c.json")       # co transcript + audio/c.mp3 -> nhan (raw)
+    (tmp_path / "audio").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "audio" / "c.mp3").write_bytes(b"x")
+    jobs = split_audio.discover_split_jobs([tmp_path])
+    assert jobs == [(tmp_path / "transcript" / "c.json", tmp_path / "audio" / "c.mp3")]
+
+
+def test_discover_flat_layout(tmp_path):
+    (tmp_path / "d.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "d.mp3").write_bytes(b"x")
+    (tmp_path / "d.clean.json").write_text("[]", encoding="utf-8")   # KHONG lam driver rieng
+    (tmp_path / "manifest.json").write_text("[]", encoding="utf-8")  # bo qua
+    jobs = split_audio.discover_split_jobs([tmp_path])
+    assert jobs == [(tmp_path / "d.json", tmp_path / "d.mp3")]
+
+
+def test_discover_single_clean_json_resolves_audio(tmp_path):
+    _touch(tmp_path / "transcript_clean" / "e.clean.json")
+    (tmp_path / "audio").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "audio" / "e.mp3").write_bytes(b"x")
+    cj = tmp_path / "transcript_clean" / "e.clean.json"
+    jobs = split_audio.discover_split_jobs([cj])
+    assert jobs == [(cj, tmp_path / "audio" / "e.mp3")]
+
+
+def test_discover_empty_defaults_to_downloads(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _touch(tmp_path / "downloads" / "transcript" / "f.json")
+    (tmp_path / "downloads" / "audio").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "downloads" / "audio" / "f.mp3").write_bytes(b"x")
+    jobs = split_audio.discover_split_jobs([])
+    assert len(jobs) == 1
+    tr, mp3 = jobs[0]
+    assert tr == Path("downloads") / "transcript" / "f.json"
+    assert mp3 == Path("downloads") / "audio" / "f.mp3"
